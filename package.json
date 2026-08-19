@@ -1,0 +1,27 @@
+{
+  "name": "pi-multi-agent",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Multi-harness subagents, workflows, and shared coordination infrastructure for Pi",
+  "license": "MIT",
+  "scripts": {
+    "test": "npm run test:subagents:portable && npm run test:workflows",
+    "test:subagents:portable": "node --test --experimental-strip-types extensions/subagents/role-lock.test.ts extensions/subagents/result-delivery.test.ts extensions/subagents/context-usage.test.ts extensions/subagents/by-the-way.test.ts",
+    "test:workflows": "node --test --experimental-strip-types extensions/workflows/sandbox.test.ts extensions/workflows/controller.test.ts extensions/workflows/meta.test.ts extensions/workflows/serialization.test.ts",
+    "format": "prettier --write extensions MULTI_AGENT_HANDOVER.md README.md",
+    "format:check": "prettier --check extensions MULTI_AGENT_HANDOVER.md README.md",
+    "smoke": "PI_OFFLINE=1 pi --no-extensions -e ./extensions/subagents/index.ts -e ./extensions/workflows/index.ts --list-models"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "0.3.218",
+    "acorn": "^8.17.0",
+    "effect": "4.0.0-beta.101"
+  },
+  "devDependencies": {
+    "prettier": "^3.6.2"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}
