@@ -1,6 +1,6 @@
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
-import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import type {
   BackendName,
   ReasoningEffort,
@@ -38,8 +38,10 @@ export interface PersistentSubagentRecord {
 export type RoleUpsert = Pick<
   PersistentSubagentRecord,
   "role" | "title" | "backend" | "cwd"
-> &
-  Partial<
+> & {
+  /** Fresh native session: do not inherit an older role's native locator. */
+  readonly resetNativeLocator?: boolean;
+} & Partial<
     Pick<
       PersistentSubagentRecord,
       | "model"
@@ -82,7 +84,17 @@ export function normalizeAndValidateRoleName(input: string): string {
   return role;
 }
 
-export function getRolesDir(agentDir = getAgentDir()): string {
+function defaultAgentDir(): string {
+  const configured = process.env.PI_CODING_AGENT_DIR;
+  if (!configured) return path.join(os.homedir(), ".pi", "agent");
+  return configured === "~"
+    ? os.homedir()
+    : configured.startsWith("~/")
+      ? path.join(os.homedir(), configured.slice(2))
+      : path.resolve(configured);
+}
+
+export function getRolesDir(agentDir = defaultAgentDir()): string {
   return path.join(agentDir, "multi-agent", "roles");
 }
 
@@ -238,8 +250,12 @@ export function upsertRole(
     model: input.model ?? existing?.model,
     modelLabel: input.modelLabel ?? existing?.modelLabel,
     reasoningEffort: input.reasoningEffort ?? existing?.reasoningEffort,
-    sessionFilePath: input.sessionFilePath ?? existing?.sessionFilePath,
-    nativeSessionId: input.nativeSessionId ?? existing?.nativeSessionId,
+    sessionFilePath: input.resetNativeLocator
+      ? input.sessionFilePath
+      : (input.sessionFilePath ?? existing?.sessionFilePath),
+    nativeSessionId: input.resetNativeLocator
+      ? input.nativeSessionId
+      : (input.nativeSessionId ?? existing?.nativeSessionId),
     lastSubagentId: input.lastSubagentId ?? existing?.lastSubagentId,
     status: input.status ?? existing?.status ?? "idle",
     createdAt: existing?.createdAt ?? now,

@@ -7,7 +7,7 @@
   "license": "MIT",
   "scripts": {
     "test": "npm run test:subagents:portable && npm run test:workflows",
-    "test:subagents:portable": "node --test --experimental-strip-types extensions/subagents/role-lock.test.ts extensions/subagents/result-delivery.test.ts extensions/subagents/context-usage.test.ts extensions/subagents/by-the-way.test.ts",
+    "test:subagents:portable": "node --test --experimental-strip-types extensions/subagents/role-lock.test.ts extensions/subagents/roles.test.ts extensions/subagents/result-delivery.test.ts extensions/subagents/context-usage.test.ts extensions/subagents/by-the-way.test.ts",
     "test:workflows": "node --test --experimental-strip-types extensions/workflows/sandbox.test.ts extensions/workflows/controller.test.ts extensions/workflows/meta.test.ts extensions/workflows/serialization.test.ts",
     "format": "prettier --write extensions MULTI_AGENT_HANDOVER.md README.md",
     "format:check": "prettier --check extensions MULTI_AGENT_HANDOVER.md README.md",

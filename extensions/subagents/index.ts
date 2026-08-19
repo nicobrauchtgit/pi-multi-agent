@@ -178,6 +178,7 @@ export default function (pi: ExtensionAPI) {
   let ui: ExtensionUIContext | undefined;
   let unsubStatus: (() => void) | undefined;
   const resultDelivery = createDeferredResultDelivery<SubagentSnapshot>();
+  const roleMetaFingerprints = new Map<string, string>();
 
   const getRuntime = () => (runtime ??= createSubagentRuntime());
 
@@ -188,8 +189,12 @@ export default function (pi: ExtensionAPI) {
       .then((manager) => {
         manager.view.setOnSettled(onSettled);
         unsubStatus?.();
-        unsubStatus = manager.view.subscribe(() => updateStatus(manager));
+        unsubStatus = manager.view.subscribe(() => {
+          updateStatus(manager);
+          syncRoleMetadata(manager);
+        });
         updateStatus(manager);
+        syncRoleMetadata(manager);
         return manager;
       });
     return managerPromise;
@@ -232,6 +237,7 @@ export default function (pi: ExtensionAPI) {
   const persistRoleSnapshot = (
     snap: SubagentSnapshot,
     extras: Parameters<typeof roleUpsertFromSnapshot>[1] = {},
+    resetNativeLocator = false,
   ) => {
     const upsert = roleUpsertFromSnapshot(snap, {
       parentPiSessionId: sessionContext?.sessionManager.getSessionId(),
@@ -239,9 +245,30 @@ export default function (pi: ExtensionAPI) {
     });
     if (!upsert) return;
     try {
-      upsertRole(upsert);
+      upsertRole({ ...upsert, resetNativeLocator });
     } catch {
       // Role persistence must not affect subagent lifecycle/result delivery.
+    }
+  };
+
+  /** Persist native locators as soon as backend metadata arrives. */
+  const syncRoleMetadata = (manager: SubagentManagerShape) => {
+    for (const snap of manager.view.list()) {
+      if (
+        !snap.role ||
+        (!snap.meta.sessionFilePath && !snap.meta.nativeSessionId)
+      ) {
+        continue;
+      }
+      const fingerprint = JSON.stringify({
+        role: snap.role,
+        modelLabel: snap.meta.modelLabel,
+        sessionFilePath: snap.meta.sessionFilePath,
+        nativeSessionId: snap.meta.nativeSessionId,
+      });
+      if (roleMetaFingerprints.get(snap.id) === fingerprint) continue;
+      roleMetaFingerprints.set(snap.id, fingerprint);
+      persistRoleSnapshot(snap);
     }
   };
 
@@ -301,6 +328,7 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_shutdown", async () => {
     sessionContext = undefined;
     resultDelivery.clear();
+    roleMetaFingerprints.clear();
     unsubStatus?.();
     unsubStatus = undefined;
     ui?.setStatus("subagents", undefined);
@@ -395,11 +423,15 @@ export default function (pi: ExtensionAPI) {
         { signal, interruptMessage: "Subagent spawn aborted." },
       );
 
-      persistRoleSnapshot(snap, {
-        model: params.model,
-        reasoningEffort: params.reasoning_effort,
-        parentPiSessionId: ctx.sessionManager.getSessionId(),
-      });
+      persistRoleSnapshot(
+        snap,
+        {
+          model: params.model,
+          reasoningEffort: params.reasoning_effort,
+          parentPiSessionId: ctx.sessionManager.getSessionId(),
+        },
+        true,
+      );
 
       return {
         content: [
