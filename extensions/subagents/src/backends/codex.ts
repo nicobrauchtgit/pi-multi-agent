@@ -24,6 +24,8 @@ import type {
   TranscriptPart,
 } from "../domain.ts";
 import { SendError, SpawnError } from "../domain.ts";
+import { codexJsonSchemaCompatibilityError } from "../../../shared/json-schema.ts";
+import { completeTextRun } from "../structured-output.ts";
 
 const REQUEST_TIMEOUT_MS = 30_000;
 const MODEL_LIST_TIMEOUT_MS = 5_000;
@@ -200,6 +202,43 @@ function textInput(text: string) {
   return { type: "text", text, text_elements: [] };
 }
 
+/** Build every turn/start request so the native schema cannot be lost on follow-ups. */
+export function buildCodexTurnStartParams(options: {
+  threadId: string;
+  text: string;
+  effort?: string;
+  schema?: unknown;
+}): JsonRecord {
+  return {
+    threadId: options.threadId,
+    input: [textInput(options.text)],
+    ...(options.effort ? { effort: options.effort } : {}),
+    ...(options.schema === undefined ? {} : { outputSchema: options.schema }),
+  };
+}
+
+const CODEX_OUTPUT_SCHEMA_MIN_VERSION = [0, 147, 0] as const;
+
+/** Fail closed because older app-servers silently ignore unknown turn fields. */
+export function codexOutputSchemaSupportError(
+  initializeResult: unknown,
+): string | undefined {
+  const userAgent = stringValue(record(initializeResult)?.userAgent);
+  const match = userAgent?.match(/^[^/\s]+\/(\d+)\.(\d+)\.(\d+)/);
+  if (!match) {
+    return "could not verify Codex outputSchema support from the app-server version";
+  }
+  const version = match.slice(1, 4).map(Number);
+  for (let index = 0; index < CODEX_OUTPUT_SCHEMA_MIN_VERSION.length; index++) {
+    if (version[index] > CODEX_OUTPUT_SCHEMA_MIN_VERSION[index])
+      return undefined;
+    if (version[index] < CODEX_OUTPUT_SCHEMA_MIN_VERSION[index]) {
+      return `Codex ${version.join(".")} does not support outputSchema; version 0.147.0 or newer is required`;
+    }
+  }
+  return undefined;
+}
+
 /**
  * Parse a `thread/tokenUsage/updated` payload into context occupancy.
  * `tokenUsage.total` accumulates every request in the thread (cached prompt
@@ -305,6 +344,15 @@ const makeCodexSession = (
   task: SpawnTask,
 ): Effect.Effect<SubagentSession, SpawnError, Scope.Scope> =>
   Effect.gen(function* () {
+    if (task.schema !== undefined) {
+      const schemaError = codexJsonSchemaCompatibilityError(task.schema);
+      if (schemaError) {
+        return yield* new SpawnError({
+          message: `Codex structured output schema is unsupported: ${schemaError}`,
+        });
+      }
+    }
+
     const binary = resolveCodexBinary();
     if (!binary) {
       return yield* new SpawnError({
@@ -340,6 +388,7 @@ const makeCodexSession = (
       dispatching: false,
       interruptRequested: false,
       effort: preferredCodexEffort(task.reasoningEffort),
+      schema: task.schema,
       runSerial: 0,
       activeTurnId: undefined as string | undefined,
       runError: undefined as string | undefined,
@@ -462,11 +511,12 @@ const makeCodexSession = (
       emit({ _tag: "UserMessage", text });
       emit({ _tag: "RunStarted" });
 
-      const params: JsonRecord = {
+      const params = buildCodexTurnStartParams({
         threadId,
-        input: [textInput(text)],
-        ...(state.effort ? { effort: state.effort } : {}),
-      };
+        text,
+        effort: state.effort,
+        schema: state.schema,
+      });
       void request("turn/start", params).then(
         (result) => {
           const turn = record(result.turn);
@@ -743,10 +793,12 @@ const makeCodexSession = (
               partialText,
             });
           } else {
-            settleRun({
-              _tag: "Completed",
-              finalText: state.finalText || state.lastAssistantText,
-            });
+            settleRun(
+              completeTextRun(
+                state.finalText || state.lastAssistantText,
+                state.schema,
+              ),
+            );
           }
           break;
         }
@@ -883,7 +935,7 @@ const makeCodexSession = (
     }
     const threadResult = yield* Effect.tryPromise({
       try: async () => {
-        await request("initialize", {
+        const initializeResult = await request("initialize", {
           clientInfo: {
             name: "pi-subagents",
             title: "pi subagent",
@@ -891,6 +943,10 @@ const makeCodexSession = (
           },
           capabilities: { experimentalApi: true },
         });
+        if (task.schema !== undefined) {
+          const supportError = codexOutputSchemaSupportError(initializeResult);
+          if (supportError) throw new Error(supportError);
+        }
         writeMessage({ method: "initialized" });
         // Headless children cannot answer approval prompts. The caller
         // already chose to launch an autonomous subagent, so give the thread

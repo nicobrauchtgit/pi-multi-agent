@@ -66,6 +66,8 @@ export interface SpawnTask {
   readonly cwd: string;
   /** Optional persistent role name used to find/follow this agent later. */
   readonly role?: string;
+  /** Bounded JSON Schema applied independently to every run in the session. */
+  readonly schema?: unknown;
   /** Native history to reopen instead of creating a fresh backend session. */
   readonly resume?: ResumeLocator;
   /** Internal role lock; the manager owns and releases it with the session. */
@@ -140,11 +142,16 @@ export interface QueuedMessage {
 // --- Events ------------------------------------------------------------------
 
 export type RunOutcome =
-  | { readonly _tag: "Completed"; readonly finalText: string }
+  | {
+      readonly _tag: "Completed";
+      readonly finalText: string;
+      readonly structured?: unknown;
+    }
   | {
       readonly _tag: "Failed";
       readonly errorText: string;
       readonly partialText?: string;
+      readonly schemaError?: string;
     }
   | { readonly _tag: "Interrupted"; readonly partialText?: string };
 
@@ -216,10 +223,16 @@ export interface SubagentSnapshot {
   readonly cwd: string;
   /** Optional persistent role name used to find/follow this agent later. */
   readonly role?: string;
+  /** Structured-output contract actually held by this live native session. */
+  readonly schema?: unknown;
   readonly status: SubagentStatus;
   readonly createdAt: number;
   readonly settledAt?: number;
   readonly errorText?: string;
+  /** Validated structured value from the most recently settled run. */
+  readonly structured?: unknown;
+  /** Structured-output extraction/validation failure for the current run. */
+  readonly schemaError?: string;
   readonly meta: SubagentMeta;
   readonly usage: { readonly tokens?: number; readonly contextWindow?: number };
   readonly transcript: ReadonlyArray<TranscriptItem>;

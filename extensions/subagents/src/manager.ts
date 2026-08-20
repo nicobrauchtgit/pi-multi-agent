@@ -11,6 +11,7 @@
  * and issue fire-and-forget commands without touching the Effect runtime.
  */
 
+import { isDeepStrictEqual } from "node:util";
 import {
   Context,
   Effect,
@@ -81,10 +82,13 @@ interface MutableSnapshot {
   prompt: string;
   cwd: string;
   role?: string;
+  schema?: unknown;
   status: SubagentStatus;
   createdAt: number;
   settledAt?: number;
   errorText?: string;
+  structured?: unknown;
+  schemaError?: string;
   meta: SubagentMeta;
   usage: { tokens?: number; contextWindow?: number };
   transcript: TranscriptItem[];
@@ -301,11 +305,17 @@ const makeManager = Effect.gen(function* () {
       case "Completed":
         s.status = "done";
         s.errorText = undefined;
+        s.structured = outcome.structured;
+        s.schemaError = undefined;
         s.finalText = outcome.finalText.slice(0, FINAL_TEXT_MAX_LENGTH);
         break;
       case "Failed":
         s.status = "error";
         s.errorText = bounded(outcome.errorText);
+        s.structured = undefined;
+        s.schemaError = outcome.schemaError
+          ? bounded(outcome.schemaError)
+          : undefined;
         // Never let a failed run report the previous run's successful output.
         s.finalText = (outcome.partialText ?? "").slice(
           0,
@@ -315,6 +325,8 @@ const makeManager = Effect.gen(function* () {
       case "Interrupted":
         s.status = "error";
         s.errorText = "Run was aborted";
+        s.structured = undefined;
+        s.schemaError = undefined;
         s.finalText = (outcome.partialText ?? "").slice(
           0,
           FINAL_TEXT_MAX_LENGTH,
@@ -344,6 +356,10 @@ const makeManager = Effect.gen(function* () {
         s.status = "running";
         s.settledAt = undefined;
         s.errorText = undefined;
+        // Structured state is per run. Unlike finalText's compatibility
+        // preview, it must never expose the previous turn as the current one.
+        s.structured = undefined;
+        s.schemaError = undefined;
         break;
       case "RunSettled":
         settle(entry, event.outcome);
@@ -503,6 +519,7 @@ const makeManager = Effect.gen(function* () {
             prompt: task.prompt,
             cwd: task.cwd,
             role: task.role,
+            schema: task.schema,
             status: "running",
             createdAt: Date.now(),
             meta,
@@ -559,32 +576,42 @@ const makeManager = Effect.gen(function* () {
     });
 
   const resumeRole = (backendName: BackendName, task: SpawnTask) =>
-    Effect.suspend(() => {
-      if (!task.role) {
-        task.roleLease?.release();
-        return new SpawnError({
-          message: "Resuming a subagent requires a role.",
-        });
-      }
-      const existing = [...entries.values()].find(
-        (entry) => entry.snapshot.role === task.role,
-      );
-      if (existing) {
-        task.roleLease?.release();
-        return send(existing.snapshot.id, task.prompt).pipe(
-          Effect.map((): ResumeRoleResult => ({
-            snapshot: existing.snapshot,
-            reopened: false,
+    Effect.suspend(
+      (): Effect.Effect<
+        ResumeRoleResult,
+        SpawnError | ConcurrencyLimitError | BackendUnavailableError | SendError
+      > => {
+        if (!task.role) {
+          task.roleLease?.release();
+          return new SpawnError({
+            message: "Resuming a subagent requires a role.",
+          });
+        }
+        const existing = [...entries.values()].find(
+          (entry) => entry.snapshot.role === task.role,
+        );
+        if (existing) {
+          task.roleLease?.release();
+          if (!isDeepStrictEqual(task.schema, existing.snapshot.schema)) {
+            return new SendError({
+              message: `Role "${task.role}" is active and its structured-output schema cannot be changed until it is reopened.`,
+            });
+          }
+          return send(existing.snapshot.id, task.prompt).pipe(
+            Effect.map((): ResumeRoleResult => ({
+              snapshot: existing.snapshot,
+              reopened: false,
+            })),
+          );
+        }
+        return spawn(backendName, task).pipe(
+          Effect.map((snapshot): ResumeRoleResult => ({
+            snapshot,
+            reopened: true,
           })),
         );
-      }
-      return spawn(backendName, task).pipe(
-        Effect.map((snapshot): ResumeRoleResult => ({
-          snapshot,
-          reopened: true,
-        })),
-      );
-    });
+      },
+    );
 
   const waitFor = (
     ids: ReadonlyArray<string>,
@@ -701,11 +728,13 @@ const makeManager = Effect.gen(function* () {
             message: `Max ${MAX_RUNNING} subagents can run concurrently; restarting "${id}" would exceed that.`,
           });
         }
-        // Occupy the slot synchronously: the RunStarted that flips status
-        // arrives via the async pump, and two concurrent restarts must not
-        // both pass the check in that window. Cleared by RunStarted/settle,
-        // or here when the backend rejects the send.
+        // Occupy the slot and clear per-turn structured state synchronously.
+        // Some backends resolve send() only after the new run has already
+        // settled; a post-send tap would erase that fresh result.
         entry.restarting = true;
+        entry.snapshot.structured = undefined;
+        entry.snapshot.schemaError = undefined;
+        notify(entry.snapshot.id);
         return entry.session.send(text).pipe(
           Effect.onError(() =>
             Effect.sync(() => {

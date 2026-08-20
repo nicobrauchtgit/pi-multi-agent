@@ -68,6 +68,58 @@ test(
 );
 
 test(
+  "Codex backend validates native structured output on repeated turns",
+  { timeout: 120_000 },
+  async (t) => {
+    if (!(await codexAvailable())) {
+      t.skip("codex executable is unavailable");
+      return;
+    }
+
+    const runtime = createSubagentRuntime();
+    try {
+      const manager = await runtime.runPromise(SubagentManager);
+      const structuredTask = {
+        ...task("Return JSON with turn 1 and word first."),
+        schema: {
+          type: "object",
+          properties: {
+            turn: { type: "number" },
+            word: { type: "string" },
+          },
+          required: ["turn", "word"],
+          additionalProperties: false,
+        },
+      };
+      const spawned = await runTool(
+        runtime,
+        manager.spawn("codex", structuredTask),
+      );
+      await deadline(runTool(runtime, manager.waitFor([spawned.id])), 60_000);
+      assert.deepEqual(manager.view.get(spawned.id)?.structured, {
+        turn: 1,
+        word: "first",
+      });
+
+      await runTool(
+        runtime,
+        manager.send(spawned.id, "Return JSON with turn 2 and word second."),
+      );
+      await deadline(runTool(runtime, manager.waitFor([spawned.id])), 60_000);
+      const followedUp = manager.view.get(spawned.id);
+      assert.equal(followedUp?.status, "done");
+      assert.deepEqual(followedUp?.structured, {
+        turn: 2,
+        word: "second",
+      });
+      assert.equal(followedUp?.schemaError, undefined);
+    } finally {
+      await runtime.dispose();
+    }
+  },
+);
+
+test(
   "Codex backend interrupt settles a live manager run",
   { timeout: 30_000 },
   async (t) => {

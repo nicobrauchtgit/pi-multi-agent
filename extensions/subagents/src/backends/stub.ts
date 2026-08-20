@@ -35,6 +35,8 @@ export interface StubProfile {
   readonly toolName: string;
   /** Delay between scripted events; varies per backend so streams differ. */
   readonly cadenceMs: number;
+  /** Test-only: delay send() resolution after dispatching the new turn. */
+  readonly sendResolutionDelayMs?: number;
 }
 
 const STUB_DIR = path.join(os.tmpdir(), "subagents-stub");
@@ -121,6 +123,9 @@ const makeStubSession = (
       Effect.gen(function* () {
         yield* emit({ _tag: "RunStarted" });
         const failing = userText.trimStart().startsWith("FAIL:");
+        const schemaFailing =
+          task.schema !== undefined &&
+          userText.trimStart().startsWith("SCHEMA_FAIL:");
 
         const thinking = "Looking at the task and planning an approach...";
         for (const delta of chunked(thinking, 16)) {
@@ -167,13 +172,19 @@ const makeStubSession = (
           contextWindow: profile.contextWindow,
         });
 
-        if (failing) {
+        if (failing || schemaFailing) {
           yield* pause;
+          const schemaError = schemaFailing
+            ? `[stub:${profile.backend}] structured output did not match the schema`
+            : undefined;
           yield* emit({
             _tag: "RunSettled",
             outcome: {
               _tag: "Failed",
-              errorText: `[stub:${profile.backend}] task failed as requested by FAIL: prefix`,
+              errorText:
+                schemaError ??
+                `[stub:${profile.backend}] task failed as requested by FAIL: prefix`,
+              ...(schemaError ? { schemaError } : {}),
             },
           });
           return;
@@ -198,7 +209,18 @@ const makeStubSession = (
         });
         yield* emit({
           _tag: "RunSettled",
-          outcome: { _tag: "Completed", finalText },
+          outcome: {
+            _tag: "Completed",
+            finalText,
+            ...(task.schema === undefined
+              ? {}
+              : {
+                  structured: {
+                    prompt: firstLine(userText).slice(0, 200),
+                    turn: turn + 1,
+                  },
+                }),
+          },
         });
       });
 
@@ -268,7 +290,14 @@ const makeStubSession = (
     return {
       meta: Effect.sync(() => state.meta),
       events: Stream.fromQueue(events),
-      send: submit,
+      send: (text) =>
+        submit(text).pipe(
+          Effect.andThen(
+            profile.sendResolutionDelayMs
+              ? Effect.sleep(Duration.millis(profile.sendResolutionDelayMs))
+              : Effect.void,
+          ),
+        ),
       interrupt: Effect.gen(function* () {
         // Drop queued prompts so interrupting cannot immediately start
         // another turn, then stop the active turn. A prompt may be mid-flight

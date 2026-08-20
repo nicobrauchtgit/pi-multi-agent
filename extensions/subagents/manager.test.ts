@@ -2,27 +2,39 @@
  * End-to-end smoke tests: manager behavior through a real ManagedRuntime,
  * exactly as the tool handlers drive it. The registry is test-only: scripted
  * stub sessions registered under the claude/codex names (the production
- * backends launch real processes and have their own live test files), plus
- * the real pi backend for its cheap registry precondition.
+ * backends launch real processes and have their own live test files), plus a
+ * deliberately failing pi fixture for spawn-cleanup coverage.
  */
 
 import assert from "node:assert/strict";
 import test from "node:test";
 import { Effect, Layer, ManagedRuntime } from "effect";
 import { BackendRegistry, type SubagentBackend } from "./src/backend.ts";
-import { piBackend } from "./src/backends/pi.ts";
 import { makeStubBackend } from "./src/backends/stub.ts";
-import type { BackendName, ParentContext, SpawnTask } from "./src/domain.ts";
+import {
+  SpawnError,
+  type BackendName,
+  type ParentContext,
+  type SpawnTask,
+} from "./src/domain.ts";
 import {
   SubagentManager,
   SubagentManagerLive,
   type SubagentManagerShape,
 } from "./src/manager.ts";
-import { runTool } from "./src/runtime.ts";
 
 const TestRegistryLive = Layer.sync(BackendRegistry, () => {
   const backends: SubagentBackend[] = [
-    piBackend,
+    {
+      name: "pi",
+      capabilities: {
+        steering: true,
+        modelSelection: true,
+        reasoningEffort: true,
+      },
+      available: Effect.succeed(true),
+      spawn: () => new SpawnError({ message: "fixture backend spawn failed" }),
+    },
     makeStubBackend({
       backend: "claude",
       defaultModelLabel: "claude/sonnet",
@@ -36,6 +48,7 @@ const TestRegistryLive = Layer.sync(BackendRegistry, () => {
       contextWindow: 272_000,
       toolName: "shell",
       cadenceMs: 30,
+      sendResolutionDelayMs: 600,
     }),
   ];
   return new Map<BackendName, SubagentBackend>(
@@ -47,6 +60,13 @@ const createTestRuntime = () =>
   ManagedRuntime.make(
     SubagentManagerLive.pipe(Layer.provide(TestRegistryLive)),
   );
+
+function runTool<A, E>(
+  runtime: ReturnType<typeof createTestRuntime>,
+  effect: Effect.Effect<A, E>,
+) {
+  return runtime.runPromise(effect);
+}
 
 const parent: ParentContext = {
   parentCwd: process.cwd(),
@@ -204,7 +224,16 @@ test("the concurrency cap rejects a fifth running subagent", async () => {
       runtime,
       Effect.forEach(
         [1, 2, 3, 4],
-        (n) => manager.spawn("codex", task(`Task ${n}`)),
+        (n) =>
+          manager.spawn(
+            "codex",
+            n === 1
+              ? {
+                  ...task(`Task ${n}`),
+                  schema: { type: "object", properties: {} },
+                }
+              : task(`Task ${n}`),
+          ),
         { concurrency: "unbounded" },
       ),
     );
@@ -216,11 +245,11 @@ test("the concurrency cap rejects a fifth running subagent", async () => {
   });
 });
 
-test("pi spawn fails fast without the parent model registry", async () => {
+test("failed backend spawn releases its concurrency reservation", async () => {
   await withManager(async (manager, runtime) => {
     await assert.rejects(
-      runTool(runtime, manager.spawn("pi", task("needs a registry"))),
-      /model registry/,
+      runTool(runtime, manager.spawn("pi", task("cannot start"))),
+      /fixture backend spawn failed/,
     );
     // The failed spawn must release its concurrency reservation.
     const snap = await runTool(runtime, manager.spawn("codex", task("ok")));
@@ -272,6 +301,152 @@ test("send steers an idle subagent into another turn", async () => {
     const afterSecond = manager.view.get(snap.id);
     assert.equal(afterSecond?.status, "done");
     assert.match(afterSecond?.finalText ?? "", /Second turn/);
+  });
+});
+
+test("a backend that resolves send after settlement cannot erase the fresh result", async () => {
+  await withManager(async (manager, runtime) => {
+    const schema = {
+      type: "object",
+      properties: {
+        prompt: { type: "string" },
+        turn: { type: "number" },
+      },
+      required: ["prompt", "turn"],
+      additionalProperties: false,
+    };
+    const started = await runTool(
+      runtime,
+      manager.spawn("codex", { ...task("First delayed turn"), schema }),
+    );
+    await runTool(runtime, manager.waitFor([started.id]));
+
+    await runTool(runtime, manager.send(started.id, "Second delayed turn"));
+    const settledBeforeSendResolved = manager.view.get(started.id);
+    assert.equal(settledBeforeSendResolved?.status, "done");
+    assert.deepEqual(settledBeforeSendResolved?.structured, {
+      prompt: "Second delayed turn",
+      turn: 2,
+    });
+  });
+});
+
+test("structured state is replaced per turn and schema failures retain partial state", async () => {
+  await withManager(async (manager, runtime) => {
+    const schema = {
+      type: "object",
+      properties: {
+        prompt: { type: "string" },
+        turn: { type: "number" },
+      },
+      required: ["prompt", "turn"],
+      additionalProperties: false,
+    };
+    const started = await runTool(
+      runtime,
+      manager.spawn("claude", { ...task("First structured turn"), schema }),
+    );
+    await runTool(runtime, manager.waitFor([started.id]));
+    assert.deepEqual(manager.view.get(started.id)?.schema, schema);
+    assert.deepEqual(manager.view.get(started.id)?.structured, {
+      prompt: "First structured turn",
+      turn: 1,
+    });
+    assert.equal(manager.view.get(started.id)?.schemaError, undefined);
+
+    await runTool(
+      runtime,
+      manager.send(started.id, "SCHEMA_FAIL: second structured turn"),
+    );
+    // send() clears the previous result before the asynchronous RunStarted
+    // event can be folded, so follow-up callers cannot observe stale data.
+    assert.equal(manager.view.get(started.id)?.structured, undefined);
+    assert.equal(manager.view.get(started.id)?.schemaError, undefined);
+    await runTool(runtime, manager.waitFor([started.id]));
+
+    const failed = manager.view.get(started.id);
+    assert.equal(failed?.status, "error");
+    assert.equal(failed?.structured, undefined);
+    assert.match(failed?.schemaError ?? "", /did not match the schema/);
+    assert.match(failed?.errorText ?? "", /did not match the schema/);
+
+    await runTool(runtime, manager.send(started.id, "Third structured turn"));
+    assert.equal(manager.view.get(started.id)?.schemaError, undefined);
+    await runTool(runtime, manager.waitFor([started.id]));
+    assert.deepEqual(manager.view.get(started.id)?.structured, {
+      prompt: "Third structured turn",
+      turn: 3,
+    });
+  });
+});
+
+test("interrupting a follow-up clears the prior structured result", async () => {
+  await withManager(async (manager, runtime) => {
+    const started = await runTool(
+      runtime,
+      manager.spawn("claude", {
+        ...task("First structured turn"),
+        schema: { type: "object", properties: {} },
+      }),
+    );
+    await runTool(runtime, manager.waitFor([started.id]));
+    assert.notEqual(manager.view.get(started.id)?.structured, undefined);
+
+    await runTool(runtime, manager.send(started.id, "Interrupted turn"));
+    while (manager.view.get(started.id)?.status !== "running") {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    await runTool(runtime, manager.cancel([started.id]));
+    const interrupted = manager.view.get(started.id);
+    assert.equal(interrupted?.structured, undefined);
+    assert.equal(interrupted?.schemaError, undefined);
+    assert.equal(interrupted?.errorText, "Run was aborted");
+  });
+});
+
+test("schema-less runs retain the original snapshot behavior", async () => {
+  await withManager(async (manager, runtime) => {
+    const started = await runTool(
+      runtime,
+      manager.spawn("codex", task("Ordinary turn")),
+    );
+    await runTool(runtime, manager.waitFor([started.id]));
+    const done = manager.view.get(started.id);
+    assert.equal(done?.status, "done");
+    assert.equal(done?.structured, undefined);
+    assert.equal(done?.schemaError, undefined);
+    assert.match(done?.finalText ?? "", /Ordinary turn/);
+  });
+});
+
+test("resumeRole compares schema overrides with the live session contract", async () => {
+  await withManager(async (manager, runtime) => {
+    const first = await runTool(
+      runtime,
+      manager.spawn("claude", {
+        ...task("First role turn"),
+        role: "reviewer",
+        schema: {
+          type: "object",
+          properties: { prompt: { type: "string" }, turn: { type: "number" } },
+          required: ["prompt", "turn"],
+        },
+      }),
+    );
+    await runTool(runtime, manager.waitFor([first.id]));
+
+    await assert.rejects(
+      runTool(
+        runtime,
+        manager.resumeRole("claude", {
+          ...task("Changed contract"),
+          role: "reviewer",
+          schema: { type: "object", properties: {} },
+        }),
+      ),
+      /schema cannot be changed/,
+    );
+    assert.equal(manager.view.get(first.id)?.status, "done");
   });
 });
 
@@ -332,7 +507,7 @@ test("failed spawn releases its role lease", async () => {
           roleLease: { release: () => releases++ },
         }),
       ),
-      /model registry/,
+      /fixture backend spawn failed/,
     );
     assert.equal(releases, 1);
   });

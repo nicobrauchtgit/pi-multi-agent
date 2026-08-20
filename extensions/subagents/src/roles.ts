@@ -1,6 +1,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { isJsonSchema } from "../../shared/json-schema.ts";
 import type {
   BackendName,
   ReasoningEffort,
@@ -26,6 +27,10 @@ export interface PersistentSubagentRecord {
   readonly model?: string;
   readonly modelLabel?: string;
   readonly reasoningEffort?: ReasoningEffort;
+  /** Structured-output contract restored with the native session. */
+  readonly schema?: unknown;
+  /** Read-time diagnostic; invalid persisted contracts must not be dropped. */
+  readonly schemaError?: string;
   readonly sessionFilePath?: string;
   readonly nativeSessionId?: string;
   readonly lastSubagentId?: string;
@@ -41,12 +46,15 @@ export type RoleUpsert = Pick<
 > & {
   /** Fresh native session: do not inherit an older role's native locator. */
   readonly resetNativeLocator?: boolean;
+  /** Explicitly remove a stale persisted structured-output contract. */
+  readonly clearSchema?: boolean;
 } & Partial<
     Pick<
       PersistentSubagentRecord,
       | "model"
       | "modelLabel"
       | "reasoningEffort"
+      | "schema"
       | "sessionFilePath"
       | "nativeSessionId"
       | "lastSubagentId"
@@ -157,6 +165,13 @@ function parseRoleRecord(value: unknown): PersistentSubagentRecord | undefined {
   ) {
     return undefined;
   }
+  const hasPersistedSchema =
+    Object.hasOwn(value, "schema") && value.schema !== undefined;
+  const validSchema = hasPersistedSchema && isJsonSchema(value.schema);
+  const schemaError =
+    hasPersistedSchema && !validSchema
+      ? "Persisted structured-output schema is invalid or no longer supported."
+      : undefined;
   return {
     version: 1,
     role,
@@ -168,10 +183,12 @@ function parseRoleRecord(value: unknown): PersistentSubagentRecord | undefined {
     reasoningEffort: isReasoningEffort(value.reasoningEffort)
       ? value.reasoningEffort
       : undefined,
+    schema: validSchema ? value.schema : undefined,
+    schemaError,
     sessionFilePath: optionalString(value.sessionFilePath),
     nativeSessionId: optionalString(value.nativeSessionId),
     lastSubagentId: optionalString(value.lastSubagentId),
-    status,
+    status: schemaError ? "missing" : status,
     createdAt,
     updatedAt,
     parentPiSessionId: optionalString(value.parentPiSessionId),
@@ -239,6 +256,9 @@ export function upsertRole(
   agentDir?: string,
 ): PersistentSubagentRecord {
   const role = normalizeAndValidateRoleName(input.role);
+  if (input.schema !== undefined && !isJsonSchema(input.schema)) {
+    throw new Error("Cannot persist an invalid structured-output schema.");
+  }
   const existing = readRole(role, agentDir);
   const now = Date.now();
   const record: PersistentSubagentRecord = {
@@ -250,6 +270,10 @@ export function upsertRole(
     model: input.model ?? existing?.model,
     modelLabel: input.modelLabel ?? existing?.modelLabel,
     reasoningEffort: input.reasoningEffort ?? existing?.reasoningEffort,
+    schema:
+      input.resetNativeLocator || input.clearSchema
+        ? input.schema
+        : (input.schema ?? existing?.schema),
     sessionFilePath: input.resetNativeLocator
       ? input.sessionFilePath
       : (input.sessionFilePath ?? existing?.sessionFilePath),
@@ -291,7 +315,10 @@ export function forgetRole(inputRole: string, agentDir?: string): boolean {
 export function roleUpsertFromSnapshot(
   snap: SubagentSnapshot,
   extras: Partial<
-    Pick<RoleUpsert, "model" | "reasoningEffort" | "parentPiSessionId">
+    Pick<
+      RoleUpsert,
+      "model" | "reasoningEffort" | "schema" | "parentPiSessionId"
+    >
   > = {},
 ): RoleUpsert | undefined {
   if (!snap.role) return undefined;
@@ -303,6 +330,7 @@ export function roleUpsertFromSnapshot(
     model: extras.model,
     modelLabel: snap.meta.modelLabel,
     reasoningEffort: extras.reasoningEffort,
+    schema: extras.schema,
     sessionFilePath: snap.meta.sessionFilePath,
     nativeSessionId: snap.meta.nativeSessionId,
     lastSubagentId: snap.id,

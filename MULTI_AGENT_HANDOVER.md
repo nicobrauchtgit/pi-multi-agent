@@ -1,6 +1,6 @@
 # Multi-Agent Setup — Handover
 
-_Last updated: 2026-08-19_
+_Last updated: 2026-08-20_
 
 This is the current handover for the Pi multi-agent repository under:
 
@@ -84,6 +84,7 @@ extensions/subagents/
   src/roles.ts                     persistent role registry under ~/.pi/agent/multi-agent/roles
   src/prompt.ts                    model-facing strings for subagent tools
   src/result-delivery.ts           deferred parent result delivery
+  src/structured-output.ts         final-JSON extraction and schema validation
   src/ui/takeover.ts               /subagents dashboard + takeover UI
   src/ui/transcript.ts             transcript rendering
 
@@ -102,6 +103,8 @@ extensions/workflows/
 
 extensions/shared/
   child-session.ts                 trust-aware child resources, tool denylist, shutdown
+  json-schema.ts                   bounded JSON Schema guard + TypeBox adapter
+  structured-output.ts             terminating Pi structured_output tool
   tool-call-timeout.ts             bounded child tool execution guard
   hunk-blackboard.ts               auto-provisioned Hunk shared blackboard
   activity-status.ts
@@ -174,6 +177,24 @@ This is now exposed to the model through:
 subagent_followup({ id, prompt })
 ```
 
+`subagent_spawn` also accepts an optional bounded, object-root JSON `schema`.
+The supported subset rejects unknown/invalid keywords and all regex-bearing
+`pattern`/`format` forms before they can enter synchronous validation. The
+contract applies independently to every turn in the native session:
+
+- Pi receives a strict schema-validated, terminating `structured_output` tool;
+- Codex 0.147+ receives native strict `turn/start.outputSchema` on every turn;
+  version and strict-schema compatibility are checked before work starts, and
+  the returned final JSON is validated locally;
+- Claude keeps the same `claude_code` base preset with or without a schema,
+  receives an injection-safe persistent final-JSON append, and has its bounded
+  final text extracted and validated locally.
+
+Snapshots and tool details expose `structured` and `schemaError`. Missing or
+invalid required structured output settles the run as `error`, while partial
+assistant text remains available for diagnosis. Starting a follow-up clears the
+prior turn's structured state before the new result arrives.
+
 ### 4.2 Persistent roles and backend-native resume — done
 
 `subagent_spawn` now accepts:
@@ -203,6 +224,7 @@ interface PersistentSubagentRecord {
   modelLabel?: string;
   reasoningEffort?:
     "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+  schema?: JsonSchema;
   sessionFilePath?: string;
   nativeSessionId?: string;
   lastSubagentId?: string;
@@ -223,7 +245,7 @@ subagent_forget   remove only the registry record; do not delete native history
 Backend-native cross-session resume is implemented through:
 
 ```text
-subagent_resume({ role, prompt, working_dir?, model?, reasoning_effort? })
+subagent_resume({ role, prompt, working_dir?, model?, reasoning_effort?, schema? })
 ```
 
 Behavior:
@@ -386,42 +408,43 @@ Remaining limitation: this resumes persisted history after restart; it does not 
 
 ---
 
-### Task B — Structured outputs for standalone subagents
+### Task B — Structured outputs for standalone subagents — completed 2026-08-20
 
-Workflow child agents already support `structured_output`. Bring a similar contract to standalone subagents.
+Implemented and verified:
 
-Possible API:
+- `subagent_spawn` accepts a bounded, semantically checked, object-root JSON
+  `schema`; invalid/unknown keywords, regex-bearing validation, non-JSON data,
+  cycles, unsafe keys, excessive depth/nodes, and oversized schemas fail before
+  manager reservation;
+- Pi injects the shared strict schema-validated terminating `structured_output`
+  tool and resets its capture sentinel at every native `agent_start`, including
+  retry/continue paths;
+- Codex sends native `turn/start.outputSchema` on every initial and follow-up
+  turn, rejects incompatible strict schemas up front, requires app-server
+  0.147.0+, then parses and validates the final assistant value defensively;
+- Claude keeps one base `claude_code` preset, adds an injection-safe persistent
+  structured-output append only when needed, then uses 64 KiB bounded,
+  single-pass raw/fenced/balanced JSON extraction and local validation for every
+  result;
+- normalized outcomes/snapshots expose `structured` and `schemaError`; tool
+  text and details use UTF-8-safe bounded renderings for large values;
+- missing or invalid required structured output is a failed run with partial
+  text retained, and all structured/schema-error state is cleared synchronously
+  before follow-up dispatch so late send resolution cannot erase fresh data;
+- named roles persist their schema, restore it during backend-native resume,
+  compare active overrides with the live session contract, and refuse to
+  silently downgrade invalid persisted contracts;
+- workflow and standalone Pi paths share the bounded schema guard and
+  terminating tool implementation;
+- portable tests cover schema semantics/security bounds, linear extraction,
+  Pi capture/reset and strict tool validation, a hermetic fake app-server
+  exercising the real Codex backend, backend request contracts, role
+  persistence, manager state transitions, output rendering, and schema-less
+  regressions.
 
-```ts
-subagent_spawn({
-  prompt,
-  name,
-  harness,
-  schema?: JsonSchema,
-  role?: string,
-  ...
-})
-```
-
-Backend strategy:
-
-- Pi: inject terminating `structured_output` tool, same as workflows.
-- Claude/Codex: likely prompt for JSON and validate final output, unless native structured output support exists.
-
-Result record should include:
-
-```ts
-structured?: unknown
-schemaError?: string
-```
-
-Persist structured results into role/run artifact store and optionally post a Hunk summary.
-
-Acceptance:
-
-- Pi standalone structured result validates and is delivered to parent.
-- Invalid structured output is surfaced as a clear error.
-- Claude/Codex either validate final JSON or clearly report unsupported/validation failure.
+Structured result artifact persistence and Hunk summaries remain deferred to
+Task D; Task B only persists the role's schema contract and exposes live run
+results.
 
 ---
 
@@ -557,7 +580,8 @@ Rollback would involve moving current `extensions/{subagents,workflows,shared}` 
 ## 9. Current known caveats
 
 - Workflow `agent()` is still Pi-only.
-- Standalone subagents do not yet support schema/structured output.
+- Structured standalone results are live snapshot/tool data only; durable run
+  artifacts and Hunk result summaries remain Task D.
 - Hunk blackboard is ephemeral and requires repo/diff context.
 - Error retry is parent-decided from error text; no special blocked state exists.
 - API/provider daily caps can break subagents. If parent can continue afterward, retry failed cap-limited subagents once.
@@ -594,3 +618,12 @@ Completed on 2026-08-19:
 4. Handover/skill updates:
    - this document rewritten;
    - project skill `use-multi-subagents-mvp` updated to describe current live setup and retry-on-transient-error behavior.
+
+Completed on 2026-08-20:
+
+1. Standalone structured outputs:
+   - bounded `schema` on spawn and resume;
+   - terminating Pi tool, native Codex `outputSchema`, persistent Claude JSON instructions;
+   - shared extraction/validation and per-turn state isolation;
+   - structured results and schema errors in normalized snapshots and tool/result delivery;
+   - role schema persistence and portable regression coverage.

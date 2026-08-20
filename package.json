@@ -6,9 +6,11 @@
   "description": "Multi-harness subagents, workflows, and shared coordination infrastructure for Pi",
   "license": "MIT",
   "scripts": {
-    "test": "npm run test:subagents:portable && npm run test:workflows",
-    "test:subagents:portable": "node --test --experimental-strip-types extensions/subagents/role-lock.test.ts extensions/subagents/roles.test.ts extensions/subagents/result-delivery.test.ts extensions/subagents/context-usage.test.ts extensions/subagents/by-the-way.test.ts",
-    "test:workflows": "node --test --experimental-strip-types extensions/workflows/sandbox.test.ts extensions/workflows/controller.test.ts extensions/workflows/meta.test.ts extensions/workflows/serialization.test.ts",
+    "test": "npm run test:shared && npm run test:subagents:portable && npm run test:workflows",
+    "test:shared": "node --test --experimental-strip-types extensions/shared/json-schema.test.ts extensions/shared/child-session.test.ts extensions/shared/context-utilization.test.ts extensions/shared/tool-call-timeout.test.ts",
+    "test:subagents:portable": "node --test --experimental-strip-types extensions/subagents/manager.test.ts extensions/subagents/role-lock.test.ts extensions/subagents/roles.test.ts extensions/subagents/result-delivery.test.ts extensions/subagents/context-usage.test.ts extensions/subagents/takeover.test.ts extensions/subagents/by-the-way.test.ts extensions/subagents/structured-output.test.ts extensions/subagents/backend-structured.test.ts extensions/subagents/pi-backend-structured.test.ts extensions/subagents/codex-hermetic.test.ts extensions/subagents/prompt.test.ts",
+    "test:workflows": "node --test --experimental-strip-types extensions/workflows/sandbox.test.ts extensions/workflows/controller.test.ts extensions/workflows/meta.test.ts extensions/workflows/serialization.test.ts extensions/workflows/runner.test.ts extensions/workflows/artifacts.test.ts",
+    "check": "npm --prefix extensions/subagents exec -- tsc --noEmit -p .",
     "format": "prettier --write extensions MULTI_AGENT_HANDOVER.md README.md",
     "format:check": "prettier --check extensions MULTI_AGENT_HANDOVER.md README.md",
     "smoke": "PI_OFFLINE=1 pi --no-extensions -e ./extensions/subagents/index.ts -e ./extensions/workflows/index.ts --list-models"
@@ -16,9 +18,11 @@
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "0.3.218",
     "acorn": "^8.17.0",
-    "effect": "4.0.0-beta.101"
+    "effect": "4.0.0-beta.101",
+    "typebox": "1.3.7"
   },
   "devDependencies": {
+    "@types/node": "24.12.4",
     "prettier": "^3.6.2"
   },
   "engines": {

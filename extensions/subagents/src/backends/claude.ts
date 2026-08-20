@@ -33,6 +33,10 @@ import type {
   TranscriptPart,
 } from "../domain.ts";
 import { SendError, SpawnError } from "../domain.ts";
+import {
+  buildStructuredTextInstruction,
+  completeTextRun,
+} from "../structured-output.ts";
 
 const CLAUDE_CONTEXT_WINDOW = 200_000;
 const INTERRUPT_TIMEOUT_MS = 2_000;
@@ -260,6 +264,18 @@ function resultContextWindow(result: SDKResultMessage) {
   return Object.values(result.modelUsage)[0]?.contextWindow;
 }
 
+export function claudeStructuredOptions(schema: unknown | undefined) {
+  return {
+    systemPrompt: {
+      type: "preset" as const,
+      preset: "claude_code" as const,
+      ...(schema === undefined
+        ? {}
+        : { append: buildStructuredTextInstruction(schema) }),
+    },
+  };
+}
+
 function waitBounded(operation: Promise<unknown>, timeoutMs: number) {
   let timer: ReturnType<typeof setTimeout> | undefined;
   const timeout = new Promise<void>((resolve) => {
@@ -363,6 +379,7 @@ const makeClaudeSession = (
             ...(thinkingBudget !== undefined
               ? { maxThinkingTokens: thinkingBudget }
               : {}),
+            ...claudeStructuredOptions(task.schema),
           },
         }),
       catch: (error) => new SpawnError({ message: boundedError(error) }),
@@ -490,10 +507,8 @@ const makeClaudeSession = (
       if (state.interruptRequested) {
         settle({ _tag: "Interrupted", partialText: partialText() });
       } else if (result.subtype === "success") {
-        settle({
-          _tag: "Completed",
-          finalText: result.result.trim() || state.currentText,
-        });
+        const finalText = result.result.trim() || state.currentText;
+        settle(completeTextRun(finalText, task.schema));
       } else {
         const details =
           result.errors.filter((error) => error.trim()).join("\n") ||

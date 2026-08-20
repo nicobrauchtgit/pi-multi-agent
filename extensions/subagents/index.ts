@@ -4,7 +4,7 @@
  *
  * Tools (for the parent LLM):
  * - subagent_spawn: fire-and-forget spawn (prompt, title, agent, working_dir,
- *   model, reasoning_effort, optional persistent role). Max 4 running at once
+ *   model, reasoning_effort, optional schema/persistent role). Max 4 running at once
  *   across all backends.
  * - subagent_followup: continue/steer a tracked subagent in this Pi session.
  * - subagent_resume: reopen a persistent role's native backend history.
@@ -26,6 +26,7 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { isDeepStrictEqual } from "node:util";
 import { StringEnum } from "@earendil-works/pi-ai";
 import type {
   ExtensionAPI,
@@ -61,6 +62,9 @@ import { SubagentManager, type SubagentManagerShape } from "./src/manager.ts";
 import {
   buildSubagentResultMessage,
   buildSubagentSpawnResult,
+  formatStructuredResult,
+  structuredResultDetails,
+  structuredResultWaitBudget,
   SUBAGENT_CANCEL_PARAMETER_DESCRIPTIONS,
   SUBAGENT_CANCEL_TOOL_DESCRIPTION,
   SUBAGENT_CHECK_PARAMETER_DESCRIPTIONS,
@@ -76,6 +80,10 @@ import {
   SUBAGENT_WAIT_TOOL_DESCRIPTION,
 } from "./src/prompt.ts";
 import { createDeferredResultDelivery } from "./src/result-delivery.ts";
+import {
+  codexJsonSchemaCompatibilityError,
+  jsonSchemaValidationError,
+} from "../shared/json-schema.ts";
 import {
   createSubagentRuntime,
   runTool,
@@ -98,6 +106,29 @@ const SUBAGENT_OUTPUT_MAX_BYTES = 24 * 1024;
 const WAIT_OUTPUT_MAX_BYTES = 48 * 1024;
 const WAIT_PER_AGENT_MAX_BYTES = 16 * 1024;
 
+function schemaParameter(description: string) {
+  return Type.Object(
+    {},
+    {
+      additionalProperties: true,
+      description,
+    },
+  );
+}
+
+function assertStructuredSchema(schema: unknown, backend?: string) {
+  const error = jsonSchemaValidationError(schema);
+  if (error) throw new Error(`Invalid structured output schema: ${error}.`);
+  if (backend === "codex") {
+    const compatibilityError = codexJsonSchemaCompatibilityError(schema);
+    if (compatibilityError) {
+      throw new Error(
+        `Codex structured output schema is unsupported: ${compatibilityError}.`,
+      );
+    }
+  }
+}
+
 interface BtwResultData {
   readonly id: string;
   readonly title: string;
@@ -115,7 +146,12 @@ function describeSubagent(snap: SubagentSnapshot) {
     formatElapsed(snap),
     snap.cwd,
   ].filter(Boolean);
-  return `${snap.id} [${snap.status}] "${snap.title}"${snap.role ? ` <${snap.role}>` : ""} (${details.join(", ")})`;
+  const structured = snap.schemaError
+    ? " [structured invalid]"
+    : snap.structured !== undefined
+      ? " [structured ok]"
+      : "";
+  return `${snap.id} [${snap.status}]${structured} "${snap.title}"${snap.role ? ` <${snap.role}>` : ""} (${details.join(", ")})`;
 }
 
 function describeRole(
@@ -130,6 +166,8 @@ function describeRole(
     record.cwd,
     record.sessionFilePath ? `session ${record.sessionFilePath}` : undefined,
     record.nativeSessionId ? `native ${record.nativeSessionId}` : undefined,
+    record.schema ? "structured" : undefined,
+    record.schemaError,
   ].filter(Boolean);
   return `${record.role} [${status}] "${record.title}" (${details.join(", ")})`;
 }
@@ -226,9 +264,17 @@ export default function (pi: ExtensionAPI) {
           status: snap.status,
           errorText: snap.errorText,
           output: truncatedOutput(snap),
+          structured: snap.structured,
+          schemaError: snap.schemaError,
         }),
         display: true,
-        details: { id: snap.id, title: snap.title, status: snap.status },
+        details: {
+          id: snap.id,
+          title: snap.title,
+          status: snap.status,
+          structured: structuredResultDetails(snap.structured),
+          schemaError: snap.schemaError,
+        },
       },
       { deliverAs: "followUp", triggerTurn: true },
     );
@@ -379,8 +425,14 @@ export default function (pi: ExtensionAPI) {
           description: SUBAGENT_SPAWN_PARAMETER_DESCRIPTIONS.role,
         }),
       ),
+      schema: Type.Optional(
+        schemaParameter(SUBAGENT_SPAWN_PARAMETER_DESCRIPTIONS.schema),
+      ),
     }),
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+      if (params.schema !== undefined) {
+        assertStructuredSchema(params.schema, params.harness);
+      }
       const manager = await getManager();
       const harness = params.harness;
 
@@ -404,6 +456,7 @@ export default function (pi: ExtensionAPI) {
           cwd,
           role,
           roleLease,
+          schema: params.schema,
           model: params.model,
           reasoningEffort: params.reasoning_effort,
           parent: {
@@ -428,6 +481,7 @@ export default function (pi: ExtensionAPI) {
         {
           model: params.model,
           reasoningEffort: params.reasoning_effort,
+          schema: params.schema,
           parentPiSessionId: ctx.sessionManager.getSessionId(),
         },
         true,
@@ -444,6 +498,7 @@ export default function (pi: ExtensionAPI) {
               modelLabel: snap.meta.modelLabel ?? "?",
               cwd,
               role,
+              structured: params.schema !== undefined,
             }),
           },
         ],
@@ -454,6 +509,8 @@ export default function (pi: ExtensionAPI) {
           harness,
           model: snap.meta.modelLabel,
           role,
+          structured: structuredResultDetails(snap.structured),
+          schemaError: snap.schemaError,
         },
       };
     },
@@ -516,6 +573,13 @@ export default function (pi: ExtensionAPI) {
         const verb = snap.status === "error" ? "failed" : "finished";
         let section = `## ${snap.id} "${snap.title}" ${verb}`;
         if (snap.errorText) section += `\nError: ${snap.errorText}`;
+        if (snap.schemaError) section += `\nSchema error: ${snap.schemaError}`;
+        if (snap.structured !== undefined) {
+          section += `\n\nStructured result:\n\`\`\`json\n${formatStructuredResult(
+            snap.structured,
+            structuredResultWaitBudget(remainingBytes),
+          )}\n\`\`\``;
+        }
         const headerBytes = Buffer.byteLength(section, "utf8") + 2;
         const outputBudget = Math.max(
           512,
@@ -546,7 +610,13 @@ export default function (pi: ExtensionAPI) {
         details: {
           results: ids.map((id) => {
             const snap = manager.view.get(id);
-            return { id, title: snap?.title, status: snap?.status };
+            return {
+              id,
+              title: snap?.title,
+              status: snap?.status,
+              structured: structuredResultDetails(snap?.structured),
+              schemaError: snap?.schemaError,
+            };
           }),
         },
       };
@@ -630,6 +700,13 @@ export default function (pi: ExtensionAPI) {
 
       let text = `${describeSubagent(snap)}\nTurns: ${snap.turns}`;
       if (snap.errorText) text += `\nError: ${snap.errorText}`;
+      if (snap.schemaError) text += `\nSchema error: ${snap.schemaError}`;
+      if (snap.structured !== undefined) {
+        text += `\n\nStructured result:\n\`\`\`json\n${formatStructuredResult(
+          snap.structured,
+          8 * 1024,
+        )}\n\`\`\``;
+      }
 
       const output = latestText(snap);
       if (output) {
@@ -642,7 +719,13 @@ export default function (pi: ExtensionAPI) {
 
       return {
         content: [{ type: "text", text }],
-        details: { id: snap.id, status: snap.status, turns: snap.turns },
+        details: {
+          id: snap.id,
+          status: snap.status,
+          turns: snap.turns,
+          structured: structuredResultDetails(snap.structured),
+          schemaError: snap.schemaError,
+        },
       };
     },
   });
@@ -668,6 +751,8 @@ export default function (pi: ExtensionAPI) {
             harness: snap.backend,
             status: snap.status,
             role: snap.role,
+            structured: structuredResultDetails(snap.structured, 1024),
+            schemaError: snap.schemaError,
           })),
         },
       };
@@ -678,7 +763,7 @@ export default function (pi: ExtensionAPI) {
     name: "subagent_followup",
     label: "Follow Up Subagent",
     description:
-      "Send a follow-up prompt to a tracked subagent in this Pi session. If it is running, the backend steers/queues the message; if it is settled, this starts a new turn in the same native session. This does not resume agents after Pi restart.",
+      "Send a follow-up prompt to a tracked subagent in this Pi session. If it is running, the backend steers/queues the message; if it is settled, this starts a new turn in the same native session. A schema-bearing subagent must produce a fresh validated structured result for each turn. This does not resume agents after Pi restart.",
     parameters: Type.Object({
       id: Type.String({
         description: "Current-session subagent id, e.g. sa-1",
@@ -732,7 +817,13 @@ export default function (pi: ExtensionAPI) {
             text: `Sent follow-up to ${snap.id} "${snap.title}"${snap.role ? ` (role ${snap.role})` : ""}.`,
           },
         ],
-        details: { id: snap.id, title: snap.title, role: snap.role },
+        details: {
+          id: snap.id,
+          title: snap.title,
+          role: snap.role,
+          structured: structuredResultDetails(snap.structured),
+          schemaError: snap.schemaError,
+        },
       };
     },
   });
@@ -763,8 +854,12 @@ export default function (pi: ExtensionAPI) {
           description: SUBAGENT_RESUME_PARAMETER_DESCRIPTIONS.reasoningEffort,
         }),
       ),
+      schema: Type.Optional(
+        schemaParameter(SUBAGENT_RESUME_PARAMETER_DESCRIPTIONS.schema),
+      ),
     }),
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+      if (params.schema !== undefined) assertStructuredSchema(params.schema);
       const manager = await getManager();
       const role = normalizeAndValidateRoleName(params.role);
       const prompt = params.prompt.trim();
@@ -774,9 +869,24 @@ export default function (pi: ExtensionAPI) {
       const tracked = manager.view
         .list()
         .find((snap) => isModelVisible(snap) && snap.role === role);
-      const record = tracked ? undefined : getRole(role);
+      const record = getRole(role);
       if (!tracked && !record) {
         throw new Error(`No persistent subagent role named "${role}".`);
+      }
+      if (!tracked && record?.schemaError && params.schema === undefined) {
+        throw new Error(
+          `Role "${role}" cannot be resumed: ${record.schemaError} Supply a replacement schema or forget and recreate the role.`,
+        );
+      }
+
+      if (
+        tracked &&
+        params.schema !== undefined &&
+        !isDeepStrictEqual(tracked.schema, params.schema)
+      ) {
+        throw new Error(
+          `Role "${role}" is active and its structured-output schema cannot be changed until it is reopened.`,
+        );
       }
 
       const savedCwd = tracked?.cwd ?? record!.cwd;
@@ -788,7 +898,7 @@ export default function (pi: ExtensionAPI) {
           ? path.resolve(ctx.cwd, params.working_dir)
           : savedCwd;
       if (!fs.existsSync(cwd) || !fs.statSync(cwd).isDirectory()) {
-        if (!params.working_dir && record) {
+        if (!tracked && !params.working_dir && record) {
           try {
             updateRole(role, { status: "missing" });
           } catch {
@@ -798,7 +908,7 @@ export default function (pi: ExtensionAPI) {
         throw new Error(`working_dir is not a directory: ${cwd}`);
       }
 
-      if (record?.backend === "pi") {
+      if (!tracked && record?.backend === "pi") {
         const sessionFile = record.sessionFilePath;
         if (
           !sessionFile ||
@@ -815,7 +925,12 @@ export default function (pi: ExtensionAPI) {
           );
         }
       }
-      if (record && record.backend !== "pi" && !record.nativeSessionId) {
+      if (
+        !tracked &&
+        record &&
+        record.backend !== "pi" &&
+        !record.nativeSessionId
+      ) {
         try {
           updateRole(role, { status: "missing" });
         } catch {
@@ -826,15 +941,22 @@ export default function (pi: ExtensionAPI) {
         );
       }
 
-      // Refresh rather than trusting a Hunk session cached before a Pi restart.
-      const blackboard = await ensureBlackboard(cwd, { refresh: true });
-      const followUp = withBlackboard(prompt, blackboard);
-      const roleLease = tracked ? undefined : acquireRoleLock(role);
       const backend = tracked?.backend ?? record!.backend;
       const model = tracked ? undefined : (params.model ?? record?.model);
       const reasoningEffort = tracked
         ? undefined
         : (params.reasoning_effort ?? record?.reasoningEffort);
+      const schema = tracked
+        ? tracked.schema
+        : (params.schema ?? record?.schema);
+      if (schema !== undefined && backend === "codex") {
+        assertStructuredSchema(schema, backend);
+      }
+
+      // Refresh rather than trusting a Hunk session cached before a Pi restart.
+      const blackboard = await ensureBlackboard(cwd, { refresh: true });
+      const followUp = withBlackboard(prompt, blackboard);
+      const roleLease = tracked ? undefined : acquireRoleLock(role);
 
       const result = await runTool(
         getRuntime(),
@@ -844,6 +966,7 @@ export default function (pi: ExtensionAPI) {
           cwd,
           role,
           roleLease,
+          schema,
           resume: record
             ? {
                 sessionFilePath: record.sessionFilePath,
@@ -877,6 +1000,8 @@ export default function (pi: ExtensionAPI) {
           model,
           modelLabel: result.snapshot.meta.modelLabel,
           reasoningEffort,
+          schema,
+          clearSchema: tracked !== undefined && schema === undefined,
           sessionFilePath: result.snapshot.meta.sessionFilePath,
           nativeSessionId: result.snapshot.meta.nativeSessionId,
           lastSubagentId: result.snapshot.id,
@@ -899,6 +1024,8 @@ export default function (pi: ExtensionAPI) {
           harness: backend,
           cwd,
           reopened: result.reopened,
+          structured: structuredResultDetails(result.snapshot.structured),
+          schemaError: result.snapshot.schemaError,
         },
       };
     },
@@ -929,7 +1056,12 @@ export default function (pi: ExtensionAPI) {
               .join("\n");
       return {
         content: [{ type: "text", text }],
-        details: { roles },
+        details: {
+          roles: roles.map(({ schema, ...record }) => ({
+            ...record,
+            schema: structuredResultDetails(schema, 1024),
+          })),
+        },
       };
     },
   });

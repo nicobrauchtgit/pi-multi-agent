@@ -70,6 +70,61 @@ test(
 );
 
 test(
+  "Claude backend validates structured output on repeated turns",
+  { timeout: 90_000 },
+  async (t) => {
+    if (!(await claudeAvailable())) {
+      t.skip("Claude Code executable is unavailable");
+      return;
+    }
+
+    const runtime = createSubagentRuntime();
+    try {
+      const manager = await runtime.runPromise(SubagentManager);
+      const structuredTask = {
+        ...task("Return only JSON with turn 1 and word first."),
+        schema: {
+          type: "object",
+          properties: {
+            turn: { type: "number" },
+            word: { type: "string" },
+          },
+          required: ["turn", "word"],
+          additionalProperties: false,
+        },
+      };
+      const started = await runTool(
+        runtime,
+        manager.spawn("claude", structuredTask),
+      );
+      await deadline(runTool(runtime, manager.waitFor([started.id])), 45_000);
+      assert.deepEqual(manager.view.get(started.id)?.structured, {
+        turn: 1,
+        word: "first",
+      });
+
+      await runTool(
+        runtime,
+        manager.send(
+          started.id,
+          "Return only JSON with turn 2 and word second.",
+        ),
+      );
+      await deadline(runTool(runtime, manager.waitFor([started.id])), 45_000);
+      const followedUp = manager.view.get(started.id);
+      assert.equal(followedUp?.status, "done");
+      assert.deepEqual(followedUp?.structured, {
+        turn: 2,
+        word: "second",
+      });
+      assert.equal(followedUp?.schemaError, undefined);
+    } finally {
+      await runtime.dispose();
+    }
+  },
+);
+
+test(
   "Claude backend interrupt settles a live run as aborted",
   { timeout: 60_000 },
   async (t) => {

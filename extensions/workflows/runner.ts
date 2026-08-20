@@ -13,7 +13,6 @@
 import {
   createAgentSession,
   DefaultResourceLoader,
-  defineTool,
   SessionManager,
   SettingsManager,
   type AgentSession,
@@ -23,7 +22,6 @@ import {
   type ExtensionContext,
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
-import { Type, type TSchema } from "typebox";
 import {
   bindChildSessionExtensions,
   childToolPolicy,
@@ -32,12 +30,12 @@ import {
 } from "../shared/child-session.ts";
 import { createToolCallTimeoutGuard } from "../shared/tool-call-timeout.ts";
 import { ensureBlackboard, withBlackboard } from "../shared/hunk-blackboard.ts";
-import { emptyUsage, type AgentUsage, type TranscriptEntry } from "./model.ts";
 import {
-  buildWorkflowAgentPrompt,
+  makeStructuredOutputTool,
   STRUCTURED_OUTPUT_SYSTEM_INSTRUCTION,
-  STRUCTURED_OUTPUT_TOOL_DESCRIPTION,
-} from "./prompt.ts";
+} from "../shared/structured-output.ts";
+import { emptyUsage, type AgentUsage, type TranscriptEntry } from "./model.ts";
+import { buildWorkflowAgentPrompt } from "./prompt.ts";
 import { safeStringify, truncateUtf8 } from "./serialization.ts";
 
 const AGENT_OUTPUT_MAX_BYTES = 64 * 1024;
@@ -129,68 +127,6 @@ export function guardWorkflowChildTools(
   guard.apply(session);
   return session.subscribe((event) => {
     if (event.type === "agent_start") guard.apply(session);
-  });
-}
-
-function isJsonSchema(value: unknown): value is TSchema {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
-  const seen = new WeakSet<object>();
-  let nodes = 0;
-  const validate = (current: unknown, depth: number): boolean => {
-    if (++nodes > 10_000 || depth > 24) return false;
-    if (
-      current === null ||
-      typeof current === "string" ||
-      typeof current === "boolean"
-    ) {
-      return true;
-    }
-    if (typeof current === "number") return Number.isFinite(current);
-    if (Array.isArray(current)) {
-      return current.every((item) => validate(item, depth + 1));
-    }
-    if (typeof current !== "object") return false;
-    if (seen.has(current)) return false;
-    seen.add(current);
-    return Object.keys(current).every((key) => {
-      if (key === "__proto__" || key === "constructor" || key === "prototype") {
-        return false;
-      }
-      return validate((current as Record<string, unknown>)[key], depth + 1);
-    });
-  };
-  return validate(value, 0);
-}
-
-/** Preserve the caller's full JSON Schema instead of lossy keyword conversion. */
-function jsonSchemaToTypebox(schema: unknown): TSchema {
-  if (!isJsonSchema(schema)) {
-    throw new Error("structured output schema must be a bounded JSON object");
-  }
-  return Type.Unsafe(schema);
-}
-
-/**
- * One-shot terminating tool injected when a schema is supplied: the subagent
- * calls it as its final action and we capture the validated object.
- */
-function makeStructuredOutputTool(
-  schema: unknown,
-  capture: (value: unknown) => void,
-): ToolDefinition {
-  return defineTool({
-    name: "structured_output",
-    label: "Structured Output",
-    description: STRUCTURED_OUTPUT_TOOL_DESCRIPTION,
-    parameters: jsonSchemaToTypebox(schema),
-    async execute(_toolCallId, params) {
-      capture(params);
-      return {
-        content: [{ type: "text", text: "Recorded structured result." }],
-        details: params,
-        terminate: true,
-      };
-    },
   });
 }
 

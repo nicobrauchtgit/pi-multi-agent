@@ -19,39 +19,59 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import {
   createAgentSession,
-  DefaultResourceLoader,
-  getAgentDir,
   SessionManager,
-  SettingsManager,
 } from "@earendil-works/pi-coding-agent";
 import type { Cause, Scope } from "effect";
 import { Effect, Queue, Stream } from "effect";
 import type { SubagentBackend, SubagentSession } from "../backend.ts";
 import type {
+  RunOutcome,
   SpawnTask,
   SubagentEvent,
   SubagentMeta,
   TranscriptPart,
 } from "../domain.ts";
 import { SendError, SpawnError } from "../domain.ts";
+import {
+  bindChildSessionExtensions,
+  childToolPolicy,
+  createChildResources,
+  shutdownAndDisposeChildSession,
+} from "../../../shared/child-session.ts";
+import {
+  makeStructuredOutputTool,
+  STRUCTURED_OUTPUT_SYSTEM_INSTRUCTION,
+} from "../../../shared/structured-output.ts";
 import { createToolCallTimeoutGuard } from "../../../shared/tool-call-timeout.ts";
+import { MISSING_STRUCTURED_OUTPUT_ERROR } from "../structured-output.ts";
 
 const CHILD_SHUTDOWN_TIMEOUT_MS = 5_000;
+const STRUCTURED_UNSET = Symbol("structured-output-unset");
 
-/** Tools that headless children must not receive. Everything else stays enabled. */
-const CHILD_EXCLUDED_TOOL_NAMES = [
-  "subagent_spawn",
-  "subagent_wait",
-  "subagent_cancel",
-  "subagent_check",
-  "subagent_list",
-  "subagent_followup",
-  "subagent_resume",
-  "subagent_roles",
-  "subagent_forget",
-  "workflow",
-  "ask_user",
-] as const;
+/** Per-native-run structured capture used by the Pi event lifecycle. */
+export function createPiStructuredCapture(required: boolean) {
+  let value: unknown | typeof STRUCTURED_UNSET = STRUCTURED_UNSET;
+  return {
+    reset() {
+      value = STRUCTURED_UNSET;
+    },
+    capture(next: unknown) {
+      value = next;
+    },
+    complete(finalText: string): RunOutcome {
+      if (!required) return { _tag: "Completed", finalText };
+      if (value === STRUCTURED_UNSET) {
+        return {
+          _tag: "Failed",
+          errorText: MISSING_STRUCTURED_OUTPUT_ERROR,
+          partialText: finalText || undefined,
+          schemaError: MISSING_STRUCTURED_OUTPUT_ERROR,
+        };
+      }
+      return { _tag: "Completed", finalText, structured: value };
+    },
+  };
+}
 
 // --- Model + effort resolution -----------------------------------------------
 
@@ -96,18 +116,7 @@ function resolvePiModel(
   throw new Error(`Unknown model "${hint}".`);
 }
 
-// --- Child session helpers (ported from v1 shared/child-session.ts) -----------
-
-/** Load normal global/package resources and trust-gated project resources. */
-async function createChildResources(cwd: string, projectTrusted: boolean) {
-  const agentDir = getAgentDir();
-  const settingsManager = SettingsManager.create(cwd, agentDir, {
-    projectTrusted,
-  });
-  const loader = new DefaultResourceLoader({ cwd, agentDir, settingsManager });
-  await loader.reload();
-  return { loader, settingsManager };
-}
+// --- Child session helpers ---------------------------------------------------
 
 function waitBounded(operation: Promise<unknown>, timeoutMs: number) {
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -125,29 +134,6 @@ function waitBounded(operation: Promise<unknown>, timeoutMs: number) {
     .finally(() => {
       if (timer) clearTimeout(timer);
     });
-}
-
-/** Emit child session_shutdown (bounded), then dispose. Never throws. */
-async function shutdownAndDisposeChildSession(session: AgentSession) {
-  try {
-    if (session.extensionRunner.hasHandlers("session_shutdown")) {
-      await waitBounded(
-        session.extensionRunner.emit({
-          type: "session_shutdown",
-          reason: "quit",
-        }),
-        CHILD_SHUTDOWN_TIMEOUT_MS,
-      );
-    }
-  } catch {
-    // Extension runner inspection/emission is best-effort during teardown.
-  } finally {
-    try {
-      session.dispose();
-    } catch {
-      // Disposal is terminal and must remain idempotent for callers.
-    }
-  }
 }
 
 // --- Event translation ----------------------------------------------------------
@@ -293,12 +279,29 @@ const makePiSession = (
       (task.resume ? undefined : task.parent.inheritedThinkingLevel)) as
       ThinkingLevel | undefined;
 
+    const structuredCapture = createPiStructuredCapture(
+      task.schema !== undefined,
+    );
+    const customTools =
+      task.schema === undefined
+        ? undefined
+        : [
+            makeStructuredOutputTool(task.schema, (value) => {
+              structuredCapture.capture(value);
+            }),
+          ];
+
     const session = yield* Effect.tryPromise({
       try: async () => {
-        const { loader, settingsManager } = await createChildResources(
-          task.cwd,
-          task.parent.projectTrusted,
-        );
+        const { loader, settingsManager } = await createChildResources({
+          cwd: task.cwd,
+          projectTrusted: task.parent.projectTrusted,
+          ...(task.schema === undefined
+            ? {}
+            : {
+                appendSystemPrompt: [STRUCTURED_OUTPUT_SYSTEM_INSTRUCTION],
+              }),
+        });
         const { session } = await createAgentSession({
           cwd: task.cwd,
           sessionManager: task.resume?.sessionFilePath
@@ -312,13 +315,14 @@ const makePiSession = (
           resourceLoader: loader,
           model,
           thinkingLevel,
-          excludeTools: [...CHILD_EXCLUDED_TOOL_NAMES],
+          ...(customTools ? { customTools } : {}),
+          ...childToolPolicy(),
         });
         // Start child extension session hooks/resources in headless mode.
         // A rejection here would otherwise leak the freshly created session:
         // the scope finalizer that owns cleanup is only registered later.
         try {
-          await session.bindExtensions({ mode: "print" });
+          await bindChildSessionExtensions(session);
         } catch (error) {
           await shutdownAndDisposeChildSession(session);
           throw error;
@@ -413,7 +417,7 @@ const makePiSession = (
       }
       emit({
         _tag: "RunSettled",
-        outcome: { _tag: "Completed", finalText: finalOutput(session) },
+        outcome: structuredCapture.complete(finalOutput(session)),
       });
     };
 
@@ -423,6 +427,10 @@ const makePiSession = (
         case "agent_start":
           // Extensions may register tools between runs; guard new ones too.
           toolTimeout.apply(session);
+          // Pi can begin work through retry/continue/queued-follow-up paths
+          // that do not call startRun(). Every native agent run therefore
+          // resets the structured capture at this lifecycle boundary.
+          structuredCapture.reset();
           state.settled = false;
           emit({ _tag: "RunStarted" });
           break;
@@ -524,6 +532,7 @@ const makePiSession = (
     const startRun = (text: string) => {
       state.runError = undefined;
       state.settled = false;
+      structuredCapture.reset();
       emit({ _tag: "RunStarted" });
       void session.prompt(text).catch((error) => {
         state.runError = boundedError(error);

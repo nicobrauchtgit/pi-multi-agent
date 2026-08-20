@@ -23,6 +23,7 @@ function workflowDetails(): WorkflowDetails {
     startedAt: 1,
     phases: [],
     agents: [],
+    logs: [],
   };
 }
 

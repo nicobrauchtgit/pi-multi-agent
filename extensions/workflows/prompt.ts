@@ -30,7 +30,7 @@ export const WORKFLOW_TOOL_DESCRIPTION = [
   "• args — the parsed value of the `args` tool parameter (or undefined).",
   "• cwd and process.cwd() — the parent working directory string for path-aware prompts and reports.",
   "Workflow JavaScript runs in a restricted, killable child with no imports, eval, timers, filesystem, network, or unrestricted process APIs. A run may make at most 32 agent calls and has no overall deadline. There is no budget API. Each agent must receive its first assistant response event within 45 seconds so silent provider requests fail clearly; after that, agent() has no wall-clock deadline. Each individual child tool call times out independently after 3 minutes, becomes an error tool result, and leaves the agent loop free to recover. Use map/filter/if/await/template strings to orchestrate, and `return` a JSON-serializable aggregate.",
-  "Pass a `schema` to agent() whenever a later step branches on the result, so you get typed fields instead of prose. There is no resume: a failed run is simply re-run. Artifacts are saved under ~/.pi/agent/workflows/<runId>/ for inspection.",
+  "Pass a `schema` to agent() whenever a later step branches on the result, so you get typed fields instead of prose. Schemas must be bounded, plain, acyclic, object-root JSON Schemas that use only supported keywords; unknown keywords and regex-bearing `pattern`, `format`, and `patternProperties` are rejected. There is no resume: a failed run is simply re-run. Artifacts are saved under ~/.pi/agent/workflows/<runId>/ for inspection.",
   "Example:",
   "export const meta = { name: 'reliability-review', description: 'Review modules for reliability risks, then report', phases: [{ title: 'Scan' }, { title: 'Report' }] }",
   "const FINDINGS = { type: 'object', properties: { issues: { type: 'array', items: { type: 'string' } }, ok: { type: 'boolean' } }, required: ['issues', 'ok'] }",
@@ -54,6 +54,7 @@ export const WORKFLOW_PROMPT_GUIDELINES = [
   "Use workflow when a task needs several subagents with phase dependencies, explicit handover, dynamic fan-out/fan-in, or verify-then-synthesize pipelines; keep single small delegations in the main session.",
   "In workflow scripts, agent() never throws — always check `.ok` on its result before using `.output`/`.structured`.",
   "Use runtime phase(title) for live progress; meta.phases is optional documentation, not a required up-front declaration.",
+  "Workflow agent schemas must be bounded, plain, acyclic, object-root JSON Schemas using supported keywords only; do not use unknown keywords or regex-bearing pattern, format, or patternProperties.",
   "There is no workflow budget API; control scope with agent count, clear prompts, schemas, and concise logs.",
 ];
 
@@ -61,14 +62,6 @@ export const WORKFLOW_PROMPT_GUIDELINES = [
 export function buildWorkflowAgentPrompt(prompt: string) {
   return prompt;
 }
-
-/** Instructs structured workflow children to terminate with exactly one structured_output call. */
-export const STRUCTURED_OUTPUT_SYSTEM_INSTRUCTION =
-  "When your task is complete, call the `structured_output` tool exactly once as your final action, with fields matching the required schema. Do not write any other text after it.";
-
-/** Describes the terminating structured_output tool and its final-action contract. */
-export const STRUCTURED_OUTPUT_TOOL_DESCRIPTION =
-  "Return your final result as structured data matching the required schema. Call this exactly once, as your last action; do not write any other text after it.";
 
 /** Builds the workflow completion report returned to the parent model. */
 export function buildWorkflowResultMessage(
