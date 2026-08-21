@@ -1,6 +1,6 @@
 # Multi-Agent Setup — Handover
 
-_Last updated: 2026-08-20_
+_Last updated: 2026-08-21_
 
 This is the current handover for the Pi multi-agent repository under:
 
@@ -128,7 +128,7 @@ Workflow agent()
   -> structured output, artifacts, workflow progress
 ```
 
-Unifying workflow `agent()` with `SubagentManager` is a major future task.
+Task C groundwork is implemented: manager snapshots can carry workflow ownership metadata, workflow-origin settlements suppress standalone parent delivery, and manager wait/get seams can support a future bridge. This does **not** unify execution: workflow `agent()` still uses the legacy Pi-only runner, and both C0 observability contracts and C1 execution unification remain not started.
 
 ---
 
@@ -448,7 +448,29 @@ results.
 
 ---
 
-### Task C — Unify workflow `agent()` with `SubagentManager`
+### Task C0 — Observability contracts and run-level workflow events — not started
+
+The metadata/delivery groundwork described in §3 is implemented, but it does not include C0 durable IDs, an observability envelope/sink, or workflow run events.
+
+Before changing workflow execution, add only the event/identity seams required by
+Task C1 and the staged observability plan in
+[`docs/observability-architecture.md`](docs/observability-architecture.md):
+
+- mint durable run/agent identity before `backend.spawn()` while keeping
+  `sa-N`/`btw-N` as display IDs;
+- add a no-op, non-throwing observability sink boundary;
+- model workflow **run-level** phase/log/settle events;
+- keep agent lifecycle out of the workflow event vocabulary;
+- preserve current `WorkflowDetails` and manager snapshots as the live TUI
+  projections.
+
+C0 must not add a daemon, database, model-visible API, child-hook claim map, or a
+second agent lifecycle vocabulary. With a no-op sink, current behavior and tests
+must remain unchanged.
+
+---
+
+### Task C1 — Unify workflow `agent()` with `SubagentManager` — not started
 
 Goal: workflow scripts can choose harness:
 
@@ -462,59 +484,129 @@ await agent("review this", {
 });
 ```
 
-Design constraints:
+Required behavior:
 
-- Workflow-owned agents should not auto-deliver standalone result follow-ups.
-- Workflow must still receive `{ ok, output, structured?, error? }`.
-- Workflow progress should continue to show in `/workflows`.
-- Ideally workflow-owned agents should also be visible in `/subagents`, marked with origin/workflow id.
-- Keep current Pi-only workflow runner path until replacement is stable.
+- consume the existing `SubagentOrigin: "workflow"` groundwork;
+- have the workflow bridge attach bounded durable `workflowRunId`, workflow
+  phase/index/label, and forced `autoDeliver: false` metadata before backend
+  spawn;
+- route workflow `agentFn` through the manager and wait for manager settlement;
+- return `{ ok, output, structured?, error? }` to the workflow script;
+- suppress standalone result follow-ups for workflow-owned agents;
+- propagate workflow cancellation and shutdown to manager cancellation;
+- keep phase/status/preview/usage/transcript visible in `/workflows`;
+- show workflow-owned agents in `/subagents` with origin/workflow identity;
+- support Pi, Claude, and Codex plus model/effort/schema selection.
 
-Likely implementation:
+The current Pi-only runner may exist only as temporary implementation scaffolding
+inside C1. C1 acceptance requires deleting/retiring that execution path and any
+fallback flag. **No Task D database work may start while both paths can run.**
+Downstream consumers must see one manager-owned agent event vocabulary.
 
-- Extend `SubagentOrigin` with `workflow`.
-- Add `workflowRunId?: string` and `autoDeliver?: false` metadata to `SpawnTask` or manager spawn options.
-- Manager settlement hook should suppress standalone result delivery for workflow-owned agents.
-- Workflow `agentFn` routes through manager, waits for settlement, captures output/structured result.
+Durable IDs/origin must be available before child work starts or observed at the
+manager boundary. Do not claim exact Pi child-hook attribution through a
+post-construction map or process-wide environment variable; defer child-hook
+claiming until a non-racy per-session API exists.
 
 Acceptance:
 
-- Workflow can run Pi/Claude/Codex children.
-- No duplicate parent follow-up for workflow-owned agents.
-- Cancellation aborts workflow-owned manager agents.
-- `/workflows` still has per-agent phase/status/preview.
+- workflow scripts run Pi/Claude/Codex children;
+- workflow explicit return values remain the source of truth;
+- no duplicate parent follow-up is delivered;
+- cancellation aborts workflow-owned manager agents;
+- both dashboards retain their current information;
+- repository tests/search prove the legacy runner cannot execute an agent.
 
 ---
 
-### Task D — Better artifact/result integration
+### Task D — Observability and artifact/result integration
 
-Create shared artifact layout, likely:
+The canonical design, schema, security model, gates, and rollback points are in
+[`docs/observability-architecture.md`](docs/observability-architecture.md).
+Implement in this order only after C1 is accepted:
 
-```text
-~/.pi/agent/multi-agent/runs/<id>/
-```
+#### D1 — Minimal daemon and SQLite projections
 
-Expose artifact path in prompts when safe. For Codex sandbox constraints, either keep artifacts inside cwd or configure writable roots.
+- one local process for ingestion, SQLite WAL, read service, and later static
+  UI;
+- only `events`, `runs`, and `agents` application tables plus
+  `PRAGMA user_version` migrations;
+- daemon-assigned receive sequence, idempotent inserts, deterministic projection
+  rebuild, and mandatory daemon-side re-redaction;
+- bounded inline content only—no external blob tier, PostgreSQL, S3, Unix
+  socket, remote auth, or native external-harness harvesting.
 
-Integrate:
+#### D2 — Pi/manager ingestion, protected spool, and autostart
+
+- parent Pi hooks plus unified manager events are primary;
+- workflow events remain run-level phase/log/settle only;
+- producer redaction, batching, bounded spool/replay, and per-project
+  disable/metadata/rich policy;
+- subagents owns one guarded `ensureDaemon()` lifecycle; workflows never start a
+  second daemon;
+- enforce child deny paths for daemon tokens, DB/WAL/SHM, spool, config,
+  existing workflow artifacts, and new run artifacts; verify `0700` directories
+  and `0600` files;
+- redact, then bound/truncate, then re-scan; store no unscanned bytes.
+
+#### D3 — Read-only API and polling web UI
+
+- authenticated run/agent/event/status/export reads;
+- static no-build UI served by the daemon;
+- sequence-cursor polling with retention-floor resync;
+- no web controls and no SSE until dogfood proves polling insufficient.
+
+#### D4 — Shared redacted artifacts and reconciliation
+
+Create a shared redacted run artifact layout for:
 
 - structured outputs;
 - final reports;
 - bounded transcripts;
-- Hunk result comments;
+- Hunk result comments when safe;
 - role records pointing to latest artifacts.
+
+Persist these for standalone and workflow-owned manager agents, closing
+`TASK-D-001`. Reconcile existing bounded workflow/shared artifacts
+idempotently as recovery/enrichment without overriding primary hook/manager
+facts. Add age/DB/spool caps, offline purge, and redacted export.
+
+Never expose the companion home to a child. If an agent must receive an output
+artifact path, use a separate agent-owned path inside its cwd/configured
+writable root (including Codex sandbox requirements), then import it through the
+same bounds/redaction pipeline.
+
+#### D5 — Dogfood and honest change summaries
+
+Tune caps/indexes from measured local use before normalizing more tables.
+Optionally add bounded changed-file summaries only after the timeline is useful;
+shared-worktree results must be labelled `shared/unattributed`. Exact child-hook
+or diff attribution requires a later non-racy API or worktree/atomic-patch
+isolation and is not a v1 claim.
+
+Task D acceptance includes the redaction leak evaluation, child deny-path tests,
+projection replay/rebuild tests, daemon-outage tests, retention/purge/export,
+and the rollback gates in the architecture document.
 
 ---
 
 ### Task E — Supervisor UX hardening
 
-Current `/subagents` takeover already supports send/abort plumbing. Improve reliability and visibility:
+Current `/subagents` takeover already supports send/abort plumbing. Improve
+reliability and visibility:
 
 - show role in rows/header;
 - show retryable provider errors distinctly if easy, but do not add new state;
 - add dashboard action for inactive role resume after Task A;
 - verify mid-run steering for Pi, Claude, Codex;
-- ensure queued follow-ups are visible.
+- ensure queued follow-ups are visible;
+- add non-model-visible links to read-only web run/agent detail when available;
+- show redaction, truncation, artifact recovery, and telemetry-gap badges without
+  making the TUI depend on the database;
+- optionally close `TASK-E-001` with a structured-output badge.
+
+The live manager remains the authority for TUI actions. Web/daemon failure must
+not disable supervision, and web controls remain deferred.
 
 ---
 

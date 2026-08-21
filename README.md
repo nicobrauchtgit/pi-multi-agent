@@ -8,6 +8,7 @@ Multi-harness subagents and model-authored workflows for [Pi](https://github.com
 - `extensions/workflows` — restricted workflow DSL with fan-out/fan-in orchestration and artifacts.
 - `extensions/shared` — child-session safety, Hunk blackboard coordination, and shared UI/status helpers.
 - `MULTI_AGENT_HANDOVER.md` — current architecture, behavior, verification commands, and next tasks.
+- [`docs/observability-architecture.md`](docs/observability-architecture.md) — staged local observability architecture, security model, schema, and C0–E delivery gates.
 - `BUGS.md` — confirmed defects, resolved review findings, and explicitly deferred implementation work.
 
 ## Local setup
