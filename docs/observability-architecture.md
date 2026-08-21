@@ -1,7 +1,7 @@
 # Observability architecture
 
-_Status: accepted staged plan; C0 and C1 implemented, D phases not started_
-_Last updated: 2026-08-22_
+_Status: accepted staged plan; C0, C1, and D1 implemented; D2-D5 not started_
+_Last updated: 2026-08-23_
 
 This document is the canonical plan for local observability in Pi Multi-Agent. It is specific enough to implement, but it deliberately avoids building the final analytics platform before the first useful slice has been dogfooded.
 
@@ -94,7 +94,7 @@ The plan relies on current repository behavior rather than a hypothetical rewrit
                      (workflow/shared artifacts and role metadata)
 ```
 
-There is no broker and no frontend build/runtime server. The daemon uses Node built-ins (`node:http`, `node:fs`, `node:crypto`, and `node:sqlite`) unless implementation evidence proves one small dependency is necessary. The daemon runtime floor is Node 22.5.0, the first Node 22 release with `node:sqlite`; startup must also probe that the built-in is importable. On an older/incompatible runtime, orchestration continues and producers remain in bounded spool-only mode, while the daemon, read API, and UI report unavailable rather than falling back to another SQLite package.
+There is no broker and no frontend build/runtime server. The D1 daemon is a no-build, bare-Node ESM companion under `companion/` (`.mjs`, Node built-ins only); Pi extensions do not import it. Security-critical redaction is the single dependency-free `extensions/shared/redaction.mjs` implementation imported by bare Node now and by the D2 producer later. The daemon runtime floor is Node 22.5.0, the first Node 22 release with `node:sqlite`; startup also probes that the built-in is constructible and performs at most one guarded `--experimental-sqlite` re-exec for early flag-gated releases. On an older/incompatible runtime, it exits with machine-readable unavailable code 69 before touching the companion home; generic software failure remains code 70. It never falls back to another SQLite package, and orchestration remains unaffected.
 
 ## 6. Identity model
 
@@ -199,7 +199,7 @@ V1 keeps content inline. Stored-field caps are measured as the UTF-8 byte length
 
 The 512 KiB event cap is strictly larger than the 256 KiB aggregate content budget plus the 128 KiB envelope allowance. The remaining 128 KiB is safety headroom, not another content budget. IDs, project data, capture/redaction metadata, field names, and JSON container syntax count against the envelope allowance.
 
-Overflow of an individual content field or the aggregate content budget is handled by deterministic UTF-8-safe field truncation/omission, not whole-event rejection. The event records original byte count when known, stored byte count, affected field paths, and `truncated: true`; no original tail is retained. Only a request-level limit or a non-content envelope that cannot fit its allowance/event cap after content is truncated causes rejection without persistence.
+Overflow of an individual content field or the aggregate content budget is handled by deterministic UTF-8-safe field truncation/omission, not whole-event rejection. The event records original byte count when known, stored byte count, affected field paths, and `truncated: true`; producer-declared truncation provenance is retained separately from any daemon-side truncation so an already-truncated capture is never reported as complete. No original tail is retained. Only a request-level limit or a non-content envelope that cannot fit its allowance/event cap after content is truncated causes rejection without persistence.
 
 Current `SubagentEvent` tool fields are UI previews, not a recoverable rich payload. D2 must not parse or inflate those previews. Backend mappings may attach a separate optional capture value when the native event exposes arguments/results; the producer bounds and redacts it before disk while the existing snapshot preview behavior remains unchanged. If a backend does not expose a value safely, the event records `contentUnavailable` rather than guessing. Finalized message content already available at the manager boundary follows the same bounds. This provides rich capture where evidence exists without relying on racy child-extension hooks.
 
@@ -276,15 +276,16 @@ The service boundary uses a `Symbol.for(...)` `globalThis` registry rather than 
   daemon.json                               0600
   ingest.token                              0600
   read.token                                0600
+  daemon-metrics.json                       0600
   observability.sqlite3                     0600
   observability.sqlite3-wal                 0600
   observability.sqlite3-shm                 0600
-  reconcile-state.json                      0600
-  spool/                                    0700
+  reconcile-state.json                      0600  (created by D4, not D1)
+  spool/                                    0700  (empty in D1)
   logs/                                     0700
 ```
 
-`daemon.json` contains protocol version, PID, loopback port, start time, and build version, but not tokens. Tokens are random 32-byte base64url capabilities with separate ingest and read authority.
+`daemon.json` contains protocol/schema/build versions, PID, loopback port, start time, and the non-authority start token used for token-checked ownership cleanup, but never either bearer capability. Bearer tokens are random 32-byte base64url values with separate ingest and future read authority; D1 mints both, but no read-token route exists until D3. `daemon-metrics.json` contains bounded counters and reason/rule classes only, never payloads or matches.
 
 At every startup the daemon:
 
@@ -295,7 +296,7 @@ At every startup the daemon:
 5. atomically writes `daemon.json`;
 6. reports ready only after migrations and permission checks pass.
 
-A second starter reads the state, checks unauthenticated protocol readiness, then authenticates a read/status request before reusing the process. It never starts a second writer. Stale locks are reclaimed only after PID/start-token validation.
+A second starter reads lock/state, checks PID/start-token consistency and unauthenticated protocol readiness, then authenticates before reusing the process. In D1, before any read-token route exists, that authenticated check is a zero-event ingest probe; D3 may use authenticated status as well. It never starts a second writer. Stale locks are reclaimed only after same-host dead-PID/start-token validation (or a conservatively stale torn lock).
 
 ### 9.3 Autostart and idle exit
 
@@ -419,7 +420,7 @@ The event table intentionally has no foreign key to projections: events may arri
 For each batch, in receive order:
 
 1. validate, path-filter, re-redact, bound, and re-scan the event;
-2. compute `payload_sha256` over the exact stored envelope payload;
+2. compute the historical `payload_sha256` column as a fingerprint over every exact normalized stored event field except daemon-assigned `seq`/`received_at_ms` and the fingerprint itself;
 3. insert the event and obtain daemon `seq`;
 4. if `event_id` already exists with the same hash, acknowledge it without projecting again;
 5. if the same `event_id` or `(producer_id, producer_seq)` has different stored bytes, reject the conflicting record, retain the original, and increment a conflict counter without logging content;
@@ -528,6 +529,8 @@ This boundary protects against model actions through supported child tools. It d
 ## 12. Read API, polling, and UI MVP
 
 ### 12.1 Routes
+
+D1 exposes only `/healthz` and `/v1/ingest`; every data-read/static route below remains absent until D3.
 
 Internal write route:
 
@@ -841,20 +844,24 @@ D1 can now start separately; C1 implemented none of D1-D5.
 
 ### D1 — minimal daemon, schema, and projections
 
-Implement:
+Status: completed 2026-08-23.
 
-- one companion process, lock/state/permission checks, SQLite WAL, migration v1;
-- exactly `events`, `runs`, and `agents` application tables;
-- ingest validation, mandatory daemon re-redaction, daemon sequence assignment, idempotent inserts, and projection reducers;
-- rebuild/status maintenance commands and storage tests.
+Implemented:
 
-Acceptance gate:
+- one bare-Node companion with strict home ownership/mode/symlink checks, an exclusive dead-PID/start-token-recoverable lock, atomic state/tokens/counters, loopback ephemeral binding, graceful checkpoint/close, and deterministic machine-readable startup/maintenance exits;
+- `node:sqlite` WAL migration v1 with exactly `events`, `runs`, and `agents` application tables, ten accepted indexes, `PRAGMA user_version`, newer-version refusal, quick/golden/foreign-key checks, and no destructive fallback;
+- only unauthenticated minimal `GET /healthz` and exact-Host/ingest-token authenticated `POST /v1/ingest`; no read data route or static UI;
+- request/event/shape/depth/node/string/content bounds; the one shared fixed-rule redactor; redact → UTF-8-safe bound/omit → complete re-scan; coarse rule/count telemetry; opaque bound IDs without lone surrogates; retained producer/daemon truncation provenance; recomputed project identity; and safe unknown-kind retention;
+- receive-order AUTOINCREMENT sequence, complete normalized-stored-event fingerprint idempotency/conflict handling, atomic event+known-projection transactions, pure daemon-sequence reducers, incomplete-row semantics, explicit-turn terminal restart, and non-projecting artifact/telemetry/unknown kinds;
+- CLI `status`, `quick-check`, and offline lock-owning `rebuild [--check]`, all using retained events ordered by daemon sequence.
 
-- sequence/replay/migration/fault tests pass;
-- no content is accepted unless all persisted bytes were scanned;
-- no external blob tier or extra normalized table is added without dogfood evidence.
+Acceptance result:
 
-Rollback: stop/disable the daemon and remove an opt-in test DB. Runtime orchestration remains unchanged because the sink is still no-op or disconnected.
+- deterministic temp-home and subprocess tests cover runtime probe/refusal, permissions/symlinks/modes/temp cleanup, compare-checked lock reclaim, token separation, HTTP Host/idle gates, migration fresh/repeat/failure/newer refusal, complete golden schema, WAL SIGKILL recovery, injected event/projection rollback, complete-event duplicates/conflicts, numeric SQLite failures, skew, incomplete rows, terminal restart, rebuild equality/drift, recursive marker-safe redaction/truncation, marker-density bounds, and seeded leak scans across DB/sidecars/logs/counters/responses;
+- no Pi hook, sink connection, autostart, spool/replay implementation, project capture integration, child path-policy change, read API/UI, artifact/retention/export/importer, extra application table, external blob/dependency, or model-visible surface was added;
+- the C0 production sink remains no-op/disconnected, so orchestration has no daemon dependency.
+
+Rollback: stop the opt-in daemon and remove only an explicitly selected D1 test companion home/database. Runtime orchestration remains unchanged because the production sink is still no-op and no extension imports `companion/`.
 
 ### D2 — Pi hooks, manager sink, autostart, and protected spool
 

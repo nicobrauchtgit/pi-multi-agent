@@ -1,0 +1,21 @@
+{
+  "compilerOptions": {
+    "allowJs": true,
+    "checkJs": true,
+    "lib": ["ESNext"],
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "noEmit": true,
+    "skipLibCheck": true,
+    "strict": true,
+    "noImplicitAny": false,
+    "target": "ESNext",
+    "types": ["node"],
+    "useUnknownInCatchVariables": false
+  },
+  "include": [
+    "companion/daemon.mjs",
+    "companion/src/**/*.mjs",
+    "extensions/shared/redaction.mjs"
+  ]
+}

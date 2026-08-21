@@ -1,6 +1,6 @@
 # Multi-Agent Setup — Handover
 
-_Last updated: 2026-08-22_
+_Last updated: 2026-08-23_
 
 This is the current handover for the Pi multi-agent repository under:
 
@@ -540,9 +540,9 @@ Acceptance evidence:
 - the opt-in live workflow suite completes one structured Pi/Claude/Codex DSL
   matrix and one real Codex cancellation with settled artifacts.
 
-Task D may now begin as a separate task. C1 did not add a daemon, SQLite,
-network/spool storage, redaction, web UI, diff capture, or observability
-persistence.
+At the C1 checkpoint, Task D could begin separately; C1 itself added no daemon,
+SQLite, network/spool storage, redaction, web UI, diff capture, or observability
+persistence. D1 is now complete below without changing that C1 runtime boundary.
 
 ---
 
@@ -552,16 +552,35 @@ The canonical design, schema, security model, gates, and rollback points are in
 [`docs/observability-architecture.md`](docs/observability-architecture.md).
 Implement in this order only after C1 is accepted:
 
-#### D1 — Minimal daemon and SQLite projections
+#### D1 — Minimal daemon and SQLite projections — completed 2026-08-23
 
-- one local process for ingestion, SQLite WAL, read service, and later static
-  UI;
-- only `events`, `runs`, and `agents` application tables plus
-  `PRAGMA user_version` migrations;
-- daemon-assigned receive sequence, idempotent inserts, deterministic projection
-  rebuild, and mandatory daemon-side re-redaction;
-- bounded inline content only—no external blob tier, PostgreSQL, S3, Unix
-  socket, remote auth, or native external-harness harvesting.
+Implemented as a standalone bare-Node ESM companion under `companion/`:
+
+- default `start` plus CLI `status`, `quick-check`, and offline
+  `rebuild [--check]`; deterministic machine-readable exits cover runtime,
+  security, lock, migration/newer-schema, and corruption failures;
+- protected companion home, dead-PID/start-token singleton lock, atomic
+  token/state/counter files, one `node:sqlite` WAL writer, migration v1, and
+  exactly `events`, `runs`, and `agents` application tables;
+- only minimal unauthenticated `/healthz` and authenticated exact-Host
+  `POST /v1/ingest`; no read data API or static UI before D3;
+- bounded inert envelope validation, opaque IDs, mandatory recursive daemon
+  re-redaction through the one shared `extensions/shared/redaction.mjs`,
+  UTF-8-safe truncation/omission and full second scan, project-ID recomputation,
+  receive-order sequence, complete stored-event fingerprint idempotency/conflicts,
+  and atomic pure-reducer projections/rebuild;
+- temp-home/subprocess tests for runtime, permissions/locks/tokens, HTTP gates,
+  schema/migrations, WAL SIGKILL recovery, fault rollback, duplicates/skew,
+  reducer/incomplete/terminal semantics, rebuild, and seeded leak scans.
+
+D1 deliberately does **not** connect the C0 sink or Pi hooks, autostart from an
+extension, implement spool/replay or child protected paths, expose read/UI
+routes, reconcile artifacts, retain/purge/export data, or change any
+model-visible surface. Production capture therefore remains no-op until D2.
+
+Rollback: stop the opt-in daemon and remove only an explicitly selected D1 test
+companion home/database. No extension imports `companion/`, so orchestration is
+unchanged.
 
 #### D2 — Pi/manager ingestion, protected spool, and autostart
 
@@ -715,10 +734,11 @@ Rollback would involve moving current `extensions/{subagents,workflows,shared}` 
 - Manager-backed workflow transcripts intentionally contain bounded UI previews,
   not the deleted runner's fuller tool payloads; rich redacted transcripts and
   oversized explicit result preservation remain Task D (see `BUGS.md`).
-- Durable shared standalone/workflow agent artifacts and observability persistence
-  remain Task D.
+- The D1 observability database/daemon exists only as an opt-in disconnected
+  companion. Pi hook/manager production, spool/autostart/path policy, and durable
+  shared standalone/workflow artifacts remain D2/D4.
 - Structured standalone results are live snapshot/tool data only; durable run
-  artifacts and Hunk result summaries remain Task D.
+  artifacts and Hunk result summaries remain D4.
 - Hunk blackboard is ephemeral and requires repo/diff context.
 - Error retry is parent-decided from error text; no special blocked state exists.
 - API/provider daily caps can break subagents. If parent can continue afterward, retry failed cap-limited subagents once.
@@ -788,3 +808,17 @@ Completed on 2026-08-22:
    - complete deletion and static non-reachability proof for the old workflow
      child execution path;
    - hermetic full gates plus opt-in live matrix/cancellation verification.
+
+Completed on 2026-08-23:
+
+1. Task D1 minimal observability companion:
+   - bare-Node loopback ingest daemon with protected singleton ownership and
+     graceful state/SQLite lifecycle;
+   - exact three-table WAL schema/migration, atomic idempotent event ingestion,
+     pure projections, status/quick-check/rebuild maintenance;
+   - single shared fixed-rule redaction with exact marker idempotency and secret-field
+     subtree suppression, full daemon re-scan, bounds and unknown-kind safety;
+   - complete stored-event idempotency fingerprints, producer truncation provenance,
+     compare-checked stale-lock reclaim, and exact golden-schema verification;
+   - deterministic storage/security/fault/subprocess acceptance coverage with no
+     D2-D5 producer, read/UI, artifact, or model-surface scope.
