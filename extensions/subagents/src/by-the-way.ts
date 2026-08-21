@@ -15,7 +15,7 @@ export function deriveBtwTitle(prompt: string) {
   return `${codePoints.slice(0, BTW_TITLE_MAX_LENGTH - 1).join("")}…`;
 }
 
-/** User asides remain visible in the dashboard but hidden from model tools. */
+/** BTW and workflow agents stay dashboard-visible but hidden from standalone model tools. */
 export function isModelVisible(snap: { readonly origin: SubagentOrigin }) {
   return snap.origin === "model";
 }

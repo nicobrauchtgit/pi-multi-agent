@@ -23,7 +23,8 @@ test("deriveBtwTitle uses the first non-empty line and bounds the title", () => 
   assert.equal(emojiTitle, `${"x".repeat(BTW_TITLE_MAX_LENGTH - 2)}😀…`);
 });
 
-test("only model-origin snapshots are visible to model-facing tools", () => {
+test("only standalone model-origin snapshots are visible to model-facing tools", () => {
   assert.equal(isModelVisible({ origin: "model" }), true);
   assert.equal(isModelVisible({ origin: "btw" }), false);
+  assert.equal(isModelVisible({ origin: "workflow" }), false);
 });

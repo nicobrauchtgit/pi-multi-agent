@@ -77,6 +77,11 @@ function appendTranscript(snapshot: MutableSnapshot, item: TranscriptItem) {
 interface MutableSnapshot {
   id: string;
   origin: SubagentOrigin;
+  autoDeliver: boolean;
+  workflowRunId?: string;
+  workflowAgentIndex?: number;
+  workflowPhase?: string;
+  workflowLabel?: string;
   backend: BackendName;
   title: string;
   prompt: string;
@@ -507,6 +512,10 @@ const makeManager = Effect.gen(function* () {
         }
 
         const origin = task.origin ?? "model";
+        const autoDeliver =
+          origin === "workflow"
+            ? false
+            : (task.autoDeliver ?? origin === "model");
         const id =
           origin === "btw" ? `btw-${++btwCounter}` : `sa-${++modelCounter}`;
         const meta = yield* session.meta;
@@ -514,6 +523,11 @@ const makeManager = Effect.gen(function* () {
           snapshot: {
             id,
             origin,
+            autoDeliver,
+            workflowRunId: task.workflowRunId,
+            workflowAgentIndex: task.workflowAgentIndex,
+            workflowPhase: task.workflowPhase,
+            workflowLabel: task.workflowLabel,
             backend: backendName,
             title: task.title,
             prompt: task.prompt,

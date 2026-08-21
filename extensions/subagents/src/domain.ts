@@ -13,8 +13,8 @@ import { Data } from "effect";
 export const BACKEND_NAMES = ["pi", "claude", "codex"] as const;
 export type BackendName = (typeof BACKEND_NAMES)[number];
 
-/** Who initiated the session. User asides stay out of model-facing tooling. */
-export type SubagentOrigin = "model" | "btw";
+/** Who initiated the session. Non-model origins stay out of standalone tooling. */
+export type SubagentOrigin = "model" | "btw" | "workflow";
 
 /**
  * Shared reasoning-effort scale (pi's thinking levels). Each backend maps a
@@ -61,6 +61,13 @@ export interface RoleLeaseHandle {
 export interface SpawnTask {
   /** Omitted for normal tool-driven spawns. */
   readonly origin?: SubagentOrigin;
+  /** Whether settlement may enqueue a standalone parent follow-up result. */
+  readonly autoDeliver?: boolean;
+  /** Optional ownership metadata for a manager-backed workflow agent. */
+  readonly workflowRunId?: string;
+  readonly workflowAgentIndex?: number;
+  readonly workflowPhase?: string;
+  readonly workflowLabel?: string;
   readonly prompt: string;
   readonly title: string;
   readonly cwd: string;
@@ -217,6 +224,12 @@ export type SubagentEvent =
 export interface SubagentSnapshot {
   readonly id: string;
   readonly origin: SubagentOrigin;
+  /** Whether settlement may enqueue a standalone parent follow-up result. */
+  readonly autoDeliver: boolean;
+  readonly workflowRunId?: string;
+  readonly workflowAgentIndex?: number;
+  readonly workflowPhase?: string;
+  readonly workflowLabel?: string;
   readonly backend: BackendName;
   readonly title: string;
   readonly prompt: string;

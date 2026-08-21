@@ -108,6 +108,7 @@ test("settlement role updates preserve the session schema", () => {
     const snapshot = {
       id: "sa-1",
       origin: "model",
+      autoDeliver: true,
       backend: "pi",
       title: "reviewer",
       prompt: "review",

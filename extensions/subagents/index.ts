@@ -79,7 +79,10 @@ import {
   SUBAGENT_WAIT_PARAMETER_DESCRIPTIONS,
   SUBAGENT_WAIT_TOOL_DESCRIPTION,
 } from "./src/prompt.ts";
-import { createDeferredResultDelivery } from "./src/result-delivery.ts";
+import {
+  createDeferredResultDelivery,
+  resultDeliveryChannel,
+} from "./src/result-delivery.ts";
 import {
   codexJsonSchemaCompatibilityError,
   jsonSchemaValidationError,
@@ -347,12 +350,13 @@ export default function (pi: ExtensionAPI) {
     // A shutdown can settle children while disposing their scopes. Never
     // append into a session whose extension runtime is already closing.
     if (!sessionContext) return;
-    if (snap.origin === "btw") {
+    const deliveryChannel = resultDeliveryChannel(snap);
+    if (deliveryChannel === "btw") {
       deliverBtwResult({ ...snap, meta: { ...snap.meta } });
       return;
     }
     persistRoleSnapshot(snap);
-    if (consumed) {
+    if (deliveryChannel === "none" || consumed) {
       resultDelivery.consume([snap.id]);
       return;
     }

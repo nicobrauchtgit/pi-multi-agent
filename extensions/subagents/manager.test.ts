@@ -158,11 +158,19 @@ test("cancel interrupts a running stub subagent", async () => {
   });
 });
 
-test("spawn origin propagates to ids, snapshots, and settlement", async () => {
+test("spawn origin, delivery defaults, and workflow ownership propagate", async () => {
   await withManager(async (manager, runtime) => {
-    const settled: Array<{ id: string; origin: string }> = [];
+    const settled: Array<{
+      id: string;
+      origin: string;
+      autoDeliver: boolean;
+    }> = [];
     manager.view.setOnSettled((snap) =>
-      settled.push({ id: snap.id, origin: snap.origin }),
+      settled.push({
+        id: snap.id,
+        origin: snap.origin,
+        autoDeliver: snap.autoDeliver,
+      }),
     );
 
     const model = await runTool(
@@ -173,28 +181,120 @@ test("spawn origin propagates to ids, snapshots, and settlement", async () => {
       runtime,
       manager.spawn("claude", { ...task("side question"), origin: "btw" }),
     );
+    const workflow = await runTool(
+      runtime,
+      manager.spawn("codex", {
+        ...task("workflow task"),
+        origin: "workflow",
+        workflowRunId: "workflow-run-1",
+        workflowAgentIndex: 2,
+        workflowPhase: "review",
+        workflowLabel: "codex review",
+      }),
+    );
+    const silentModel = await runTool(
+      runtime,
+      manager.spawn("claude", {
+        ...task("manually collected model task"),
+        autoDeliver: false,
+      }),
+    );
 
     assert.match(model.id, /^sa-/);
     assert.equal(model.origin, "model");
+    assert.equal(model.autoDeliver, true);
     assert.match(btw.id, /^btw-/);
     assert.equal(btw.origin, "btw");
+    assert.equal(btw.autoDeliver, false);
+    assert.match(workflow.id, /^sa-/);
+    assert.equal(workflow.origin, "workflow");
+    assert.equal(workflow.autoDeliver, false);
+    assert.equal(workflow.workflowRunId, "workflow-run-1");
+    assert.equal(workflow.workflowAgentIndex, 2);
+    assert.equal(workflow.workflowPhase, "review");
+    assert.equal(workflow.workflowLabel, "codex review");
+    assert.equal(silentModel.origin, "model");
+    assert.equal(silentModel.autoDeliver, false);
+    // The synchronous read model is the unfiltered source for /subagents.
+    assert.ok(manager.view.list().some((snap) => snap.id === workflow.id));
 
-    await runTool(runtime, manager.cancel([model.id, btw.id]));
+    await runTool(
+      runtime,
+      manager.cancel([model.id, btw.id, workflow.id, silentModel.id]),
+    );
     assert.deepEqual(
       settled.sort((a, b) => a.id.localeCompare(b.id)),
       [
-        { id: btw.id, origin: "btw" },
-        { id: model.id, origin: "model" },
+        { id: btw.id, origin: "btw", autoDeliver: false },
+        { id: model.id, origin: "model", autoDeliver: true },
+        { id: silentModel.id, origin: "model", autoDeliver: false },
+        { id: workflow.id, origin: "workflow", autoDeliver: false },
       ].sort((a, b) => a.id.localeCompare(b.id)),
     );
   });
 });
 
-test("the global concurrency cap includes by-the-way sessions", async () => {
+test("a workflow bridge can spawn, wait, and read one structured settlement", async () => {
+  await withManager(async (manager, runtime) => {
+    const schema = {
+      type: "object",
+      properties: {
+        prompt: { type: "string" },
+        turn: { type: "number" },
+      },
+      required: ["prompt", "turn"],
+      additionalProperties: false,
+    };
+    const settlements: Array<{ id: string; consumed: boolean }> = [];
+    manager.view.setOnSettled((snap, consumed) => {
+      settlements.push({ id: snap.id, consumed });
+    });
+
+    const started = await runTool(
+      runtime,
+      manager.spawn("claude", {
+        ...task("Return workflow data"),
+        origin: "workflow",
+        autoDeliver: true,
+        workflowRunId: "workflow-run-structured",
+        workflowAgentIndex: 3,
+        workflowPhase: "synthesize",
+        workflowLabel: "structured synthesis",
+        schema,
+      }),
+    );
+    assert.equal(started.autoDeliver, false);
+
+    await runTool(runtime, manager.waitFor([started.id]));
+    const settled = await runTool(runtime, manager.get(started.id));
+
+    assert.ok(settled);
+    assert.equal(settled.status, "done");
+    assert.equal(settled.origin, "workflow");
+    assert.equal(settled.autoDeliver, false);
+    assert.equal(settled.workflowRunId, "workflow-run-structured");
+    assert.equal(settled.workflowAgentIndex, 3);
+    assert.equal(settled.workflowPhase, "synthesize");
+    assert.equal(settled.workflowLabel, "structured synthesis");
+    assert.deepEqual(settled.schema, schema);
+    assert.deepEqual(settled.structured, {
+      prompt: "Return workflow data",
+      turn: 1,
+    });
+    assert.deepEqual(settlements, [{ id: started.id, consumed: true }]);
+  });
+});
+
+test("the global concurrency cap includes every origin", async () => {
   await withManager(async (manager, runtime) => {
     const tasks: SpawnTask[] = [
       { ...task("side question"), origin: "btw" },
-      task("Task 2"),
+      {
+        ...task("workflow task"),
+        origin: "workflow",
+        workflowRunId: "workflow-run-cap",
+        workflowAgentIndex: 0,
+      },
       task("Task 3"),
       task("Task 4"),
     ];

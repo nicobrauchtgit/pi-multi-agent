@@ -1,6 +1,36 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { createDeferredResultDelivery } from "./src/result-delivery.ts";
+import {
+  createDeferredResultDelivery,
+  resultDeliveryChannel,
+} from "./src/result-delivery.ts";
+
+test("settlement routing preserves standalone and btw delivery while suppressing workflows", () => {
+  assert.equal(
+    resultDeliveryChannel({ origin: "model", autoDeliver: true }),
+    "standalone",
+  );
+  assert.equal(
+    resultDeliveryChannel({ origin: "model", autoDeliver: false }),
+    "none",
+  );
+  assert.equal(
+    resultDeliveryChannel({ origin: "workflow", autoDeliver: false }),
+    "none",
+  );
+  assert.equal(
+    resultDeliveryChannel({ origin: "workflow", autoDeliver: true }),
+    "none",
+  );
+  assert.equal(
+    resultDeliveryChannel({ origin: "btw", autoDeliver: false }),
+    "btw",
+  );
+  assert.equal(
+    resultDeliveryChannel({ origin: "btw", autoDeliver: true }),
+    "btw",
+  );
+});
 
 test("a result consumed by a later wait is not delivered", () => {
   const delivery = createDeferredResultDelivery<{
