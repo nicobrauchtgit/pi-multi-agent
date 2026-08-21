@@ -30,6 +30,8 @@ import {
   type SpawnTask,
 } from "./src/domain.ts";
 import {
+  MAX_ADMISSION_WAITERS,
+  MAX_TRACKED,
   SubagentManager,
   SubagentManagerLive,
   SubagentManagerWithSink,
@@ -74,6 +76,46 @@ const createTestRuntime = () =>
     SubagentManagerLive.pipe(Layer.provide(TestRegistryLive)),
   );
 
+function instantBackend(name: BackendName = "codex"): SubagentBackend {
+  return {
+    name,
+    capabilities: {
+      steering: true,
+      modelSelection: true,
+      reasoningEffort: true,
+    },
+    available: Effect.succeed(true),
+    spawn: (spawnTask) =>
+      Effect.succeed({
+        meta: Effect.succeed({
+          backend: name,
+          modelLabel: spawnTask.model ?? `${name}/instant`,
+          contextWindow: 100_000,
+        }),
+        events: Stream.fromIterable([
+          { _tag: "UserMessage" as const, text: spawnTask.prompt },
+          { _tag: "RunStarted" as const },
+          {
+            _tag: "AssistantMessage" as const,
+            parts: [{ type: "text" as const, text: spawnTask.prompt }],
+          },
+          {
+            _tag: "RunSettled" as const,
+            outcome: {
+              _tag: "Completed" as const,
+              finalText: spawnTask.prompt,
+              ...(spawnTask.schema === undefined
+                ? {}
+                : { structured: { value: spawnTask.prompt } }),
+            },
+          },
+        ]),
+        send: () => Effect.void,
+        interrupt: Effect.void,
+      }),
+  };
+}
+
 function registryLayer(backends: ReadonlyArray<SubagentBackend>) {
   return Layer.succeed(
     BackendRegistry,
@@ -109,6 +151,14 @@ const parent: ParentContext = {
 
 function task(prompt: string): SpawnTask {
   return { prompt, title: "test", cwd: process.cwd(), parent };
+}
+
+async function waitUntil(predicate: () => boolean, timeoutMs = 2_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() >= deadline) throw new Error("Timed out waiting for state");
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
 }
 
 async function withManager(
@@ -285,7 +335,7 @@ test("spawn origin, delivery defaults, and workflow ownership propagate", async 
   });
 });
 
-test("a workflow bridge can spawn, wait, and read one structured settlement", async () => {
+test("runWorkflowAgent atomically returns one immutable structured settlement", async () => {
   await withManager(async (manager, runtime) => {
     const schema = {
       type: "object",
@@ -301,12 +351,10 @@ test("a workflow bridge can spawn, wait, and read one structured settlement", as
       settlements.push({ id: snap.id, consumed });
     });
 
-    const started = await runTool(
+    const collected = await runTool(
       runtime,
-      manager.spawn("claude", {
+      manager.runWorkflowAgent("claude", {
         ...task("Return workflow data"),
-        origin: "workflow",
-        autoDeliver: true,
         workflowRunId: "wf_000000000002",
         workflowAgentIndex: 3,
         workflowPhase: "synthesize",
@@ -314,12 +362,8 @@ test("a workflow bridge can spawn, wait, and read one structured settlement", as
         schema,
       }),
     );
-    assert.equal(started.autoDeliver, false);
-
-    await runTool(runtime, manager.waitFor([started.id]));
-    const settled = await runTool(runtime, manager.get(started.id));
-
-    assert.ok(settled);
+    const settled = collected.snapshot;
+    assert.equal(collected.outcome._tag, "Completed");
     assert.equal(settled.status, "done");
     assert.equal(settled.origin, "workflow");
     assert.equal(settled.autoDeliver, false);
@@ -332,7 +376,30 @@ test("a workflow bridge can spawn, wait, and read one structured settlement", as
       prompt: "Return workflow data",
       turn: 1,
     });
-    assert.deepEqual(settlements, [{ id: started.id, consumed: true }]);
+    assert.equal(Object.isFrozen(collected), true);
+    assert.equal(Object.isFrozen(settled), true);
+    assert.deepEqual(settlements, [{ id: settled.id, consumed: true }]);
+  });
+});
+
+test("workflow collection reports a failed schema copy", async () => {
+  await withManager(async (manager, runtime) => {
+    const schema: Record<string, unknown> = { type: "object" };
+    schema.self = schema;
+    const collected = await runTool(
+      runtime,
+      manager.runWorkflowAgent("claude", {
+        ...task("Return workflow data"),
+        workflowRunId: "wf_000000000004",
+        workflowAgentIndex: 1,
+        schema,
+      }),
+    );
+    assert.match(
+      collected.collectionError ?? "",
+      /structured output schema was not JSON serializable/i,
+    );
+    assert.equal(collected.snapshot.schema, undefined);
   });
 });
 
@@ -344,7 +411,7 @@ test("the global concurrency cap includes every origin", async () => {
         ...task("workflow task"),
         origin: "workflow",
         workflowRunId: "wf_000000000003",
-        workflowAgentIndex: 0,
+        workflowAgentIndex: 1,
       },
       task("Task 3"),
       task("Task 4"),
@@ -367,6 +434,210 @@ test("the global concurrency cap includes every origin", async () => {
       /Max 4 subagents/,
     );
   });
+});
+
+test("workflow collection survives high-fanout churn beyond MAX_TRACKED", async () => {
+  const runtime = createObservedRuntime(
+    createRecordingSink(),
+    registryLayer([instantBackend()]),
+  );
+  try {
+    const manager = await runtime.runPromise(SubagentManager);
+    const results = [];
+    for (let batch = 0; batch < 3; batch++) {
+      const collected = await Promise.all(
+        Array.from({ length: 32 }, (_, offset) => {
+          const index = batch * 32 + offset + 1;
+          return runtime.runPromise(
+            manager.runWorkflowAgent("codex", {
+              ...task(`result-${index}`),
+              workflowRunId: "wf_111111111111",
+              workflowAgentIndex: index,
+            }),
+          );
+        }),
+      );
+      results.push(...collected);
+    }
+    assert.ok(results.length > MAX_TRACKED);
+    assert.equal(
+      new Set(results.map((result) => result.snapshot.finalText)).size,
+      96,
+    );
+    assert.ok(results.every((result) => result.outcome._tag === "Completed"));
+    assert.ok(manager.view.size() <= MAX_TRACKED);
+  } finally {
+    await runtime.dispose();
+  }
+});
+
+test("workflow admission is FIFO while standalone spawns remain non-blocking", async () => {
+  await withManager(async (manager, runtime) => {
+    const holders = await Promise.all(
+      Array.from({ length: 4 }, (_, index) =>
+        runTool(runtime, manager.spawn("codex", task(`holder-${index}`))),
+      ),
+    );
+    const order: string[] = [];
+    let waits = 0;
+    const firstAbort = new AbortController();
+    const secondAbort = new AbortController();
+    const first = runtime.runPromise(
+      manager.runWorkflowAgent(
+        "claude",
+        {
+          ...task("first"),
+          workflowRunId: "wf_222222222222",
+          workflowAgentIndex: 1,
+        },
+        {
+          signal: firstAbort.signal,
+          onAdmissionWait: () => waits++,
+          onSpawned: () => order.push("first"),
+        },
+      ),
+    );
+    const second = runtime.runPromise(
+      manager.runWorkflowAgent(
+        "claude",
+        {
+          ...task("second"),
+          workflowRunId: "wf_222222222222",
+          workflowAgentIndex: 2,
+        },
+        {
+          signal: secondAbort.signal,
+          onAdmissionWait: () => waits++,
+          onSpawned: () => order.push("second"),
+        },
+      ),
+    );
+    await waitUntil(() => waits === 2);
+    await assert.rejects(
+      runTool(runtime, manager.spawn("claude", task("standalone fifth"))),
+      /Max 4 subagents/,
+    );
+    await runTool(runtime, manager.cancel([holders[0].id]));
+    await waitUntil(() => order.length >= 1);
+    assert.equal(order[0], "first");
+    await runTool(runtime, manager.cancel([holders[1].id]));
+    await waitUntil(() => order.length >= 2);
+    assert.deepEqual(order.slice(0, 2), ["first", "second"]);
+    firstAbort.abort();
+    secondAbort.abort();
+    await Promise.all([first, second]);
+    await runTool(
+      runtime,
+      manager.cancel(holders.slice(2).map((snapshot) => snapshot.id)),
+    );
+  });
+});
+
+test("aborting admission wait removes it and the waiter cap is deterministic", async () => {
+  await withManager(async (manager, runtime) => {
+    const holders = await Promise.all(
+      Array.from({ length: 4 }, (_, index) =>
+        runTool(runtime, manager.spawn("codex", task(`holder-${index}`))),
+      ),
+    );
+    const controllers = Array.from(
+      { length: MAX_ADMISSION_WAITERS + 1 },
+      () => new AbortController(),
+    );
+    let waiting = 0;
+    const queued = controllers.map((controller, index) =>
+      runtime.runPromise(
+        manager.runWorkflowAgent(
+          "claude",
+          {
+            ...task(`queued-${index}`),
+            workflowRunId: "wf_333333333333",
+            workflowAgentIndex: index + 1,
+          },
+          {
+            signal: controller.signal,
+            onAdmissionWait: () => waiting++,
+          },
+        ),
+      ),
+    );
+    await waitUntil(() => waiting === MAX_ADMISSION_WAITERS);
+    await assert.rejects(queued.at(-1)!, /queue is full/);
+    for (const controller of controllers) controller.abort();
+    await Promise.allSettled(queued);
+    await runTool(
+      runtime,
+      manager.cancel(holders.map((snapshot) => snapshot.id)),
+    );
+  });
+});
+
+test("workflow cancellation collects Interrupted and rejects steering", async () => {
+  await withManager(async (manager, runtime) => {
+    const abort = new AbortController();
+    let spawnedId = "";
+    const collection = runtime.runPromise(
+      manager.runWorkflowAgent(
+        "claude",
+        {
+          ...task("cancel me"),
+          workflowRunId: "wf_444444444444",
+          workflowAgentIndex: 1,
+        },
+        {
+          signal: abort.signal,
+          onSpawned: (snapshot) => {
+            spawnedId = snapshot.id;
+            abort.abort();
+          },
+        },
+      ),
+    );
+    const settled = await collection;
+    assert.equal(settled.outcome._tag, "Interrupted");
+    assert.equal(settled.snapshot.status, "error");
+    assert.equal(settled.snapshot.autoDeliver, false);
+    await assert.rejects(
+      runTool(runtime, manager.send(spawnedId, "continue")),
+      /Workflow-origin subagents cannot be steered/,
+    );
+  });
+});
+
+test("workflow ownership metadata is byte-bounded before snapshots", async () => {
+  const runtime = createObservedRuntime(
+    createRecordingSink(),
+    registryLayer([instantBackend()]),
+  );
+  try {
+    const manager = await runtime.runPromise(SubagentManager);
+    const long = "界".repeat(400);
+    const result = await runtime.runPromise(
+      manager.runWorkflowAgent("codex", {
+        ...task("bounded"),
+        workflowRunId: "wf_555555555555",
+        workflowAgentIndex: 1,
+        workflowLabel: long,
+        workflowPhase: long,
+      }),
+    );
+    assert.ok(Buffer.byteLength(result.snapshot.workflowLabel!, "utf8") <= 256);
+    assert.ok(Buffer.byteLength(result.snapshot.workflowPhase!, "utf8") <= 256);
+    for (const invalid of [0, 1025, 1.5]) {
+      await assert.rejects(
+        runtime.runPromise(
+          manager.runWorkflowAgent("codex", {
+            ...task("invalid"),
+            workflowRunId: "wf_555555555555",
+            workflowAgentIndex: invalid,
+          }),
+        ),
+        /workflowAgentIndex between 1 and 1024/,
+      );
+    }
+  } finally {
+    await runtime.dispose();
+  }
 });
 
 test("the concurrency cap rejects a fifth running subagent", async () => {
@@ -709,10 +980,9 @@ test("reservation rejection releases its role lease", async () => {
   });
 });
 
-test("workflow-origin reservations require the repository workflow ID grammar", async () => {
+test("workflow-origin reservations validate ownership and reject role state", async () => {
   const recording = createRecordingSink();
   await withObservedManager(recording, async (manager, runtime) => {
-    let releases = 0;
     for (const workflowRunId of [undefined, "workflow-run-invalid"]) {
       await assert.rejects(
         runTool(
@@ -720,15 +990,30 @@ test("workflow-origin reservations require the repository workflow ID grammar", 
           manager.spawn("codex", {
             ...task("invalid workflow identity"),
             origin: "workflow",
-            role: "invalid-workflow-role",
-            roleLease: { release: () => releases++ },
+            workflowAgentIndex: 1,
             ...(workflowRunId ? { workflowRunId } : {}),
           }),
         ),
         /valid workflowRunId/,
       );
     }
-    assert.equal(releases, 2);
+
+    let releases = 0;
+    await assert.rejects(
+      runTool(
+        runtime,
+        manager.spawn("codex", {
+          ...task("invalid workflow role"),
+          origin: "workflow",
+          workflowRunId: "wf_0123456789ab",
+          workflowAgentIndex: 1,
+          role: "invalid-workflow-role",
+          roleLease: { release: () => releases++ },
+        }),
+      ),
+      /cannot use roles/,
+    );
+    assert.equal(releases, 1);
     assert.deepEqual(recording.events, []);
   });
 });

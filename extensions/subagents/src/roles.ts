@@ -321,7 +321,7 @@ export function roleUpsertFromSnapshot(
     >
   > = {},
 ): RoleUpsert | undefined {
-  if (!snap.role) return undefined;
+  if (snap.origin !== "model" || !snap.role) return undefined;
   return {
     role: snap.role,
     title: snap.title,

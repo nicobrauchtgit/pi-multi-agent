@@ -139,6 +139,7 @@ export class RunController {
         acquired = true;
         if (taskAbort.signal.aborted) throw abortError(taskAbort.signal);
         const result = await task(taskAbort.signal);
+        if (taskAbort.signal.aborted) throw abortError(taskAbort.signal);
         if (invocationSignal?.aborted) throw abortError(invocationSignal);
         return result;
       } finally {

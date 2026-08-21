@@ -47,6 +47,38 @@ test("sandbox exposes only workflow capabilities and validates results", async (
   assert.deepEqual(phases, ["Gather"]);
 });
 
+test("sandbox passes the C1 agent option vocabulary and drops unknown keys", async () => {
+  let received: unknown;
+  const result = await run(
+    `return await agent("review", {
+      harness: "codex",
+      label: "reviewer",
+      phase: "Review",
+      schema: { type: "object", properties: {} },
+      model: "gpt-test",
+      provider: "fixture",
+      effort: "high",
+      unknown: "drop-me",
+    });`,
+    {
+      onAgent: async (_prompt, options) => {
+        received = options;
+        return { ok: true, output: "ok" };
+      },
+    },
+  );
+  assert.deepEqual(result, { ok: true, output: "ok" });
+  assert.deepEqual(received, {
+    harness: "codex",
+    label: "reviewer",
+    phase: "Review",
+    schema: { type: "object", properties: {} },
+    model: "gpt-test",
+    provider: "fixture",
+    effort: "high",
+  });
+});
+
 test("sandbox pipeline fans out items while running stages sequentially", async () => {
   let active = 0;
   let maxActive = 0;

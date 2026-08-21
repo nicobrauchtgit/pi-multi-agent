@@ -3,6 +3,7 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 import {
   createAgentSession,
   DefaultResourceLoader,
@@ -18,6 +19,8 @@ import {
   CHILD_EXCLUDED_TOOL_NAMES,
   childToolPolicy,
   createChildResources,
+  filterChildExtensionPaths,
+  isChildExtensionLoad,
   resolveStandaloneChildProjectTrust,
   shutdownAndDisposeChildSession,
   type DisposableChildSession,
@@ -255,6 +258,121 @@ test("shutdown helper balances hooks and disposal despite errors", async () => {
   ]);
   assert.equal(emits, 1);
   assert.equal(disposals, 1);
+});
+
+test("child extension path filtering removes only orchestration entry points", async () => {
+  await withTempDir(async (directory) => {
+    const subagents = path.join(directory, "subagents");
+    const workflows = path.join(directory, "workflows");
+    const retained = path.join(directory, "retained");
+    await Promise.all(
+      [subagents, workflows, retained].map((entry) => mkdir(entry)),
+    );
+    assert.deepEqual(
+      filterChildExtensionPaths(
+        [subagents, workflows, retained, "npm:fixture-extension"],
+        [subagents, workflows],
+      ),
+      [retained, "npm:fixture-extension"],
+    );
+  });
+});
+
+test("real child resource reload excludes orchestration extensions and scopes factories", async () => {
+  await withTempDir(async (directory) => {
+    const cwd = path.join(directory, "project");
+    const agentDir = path.join(directory, "agent");
+    const fixture = path.join(directory, "scope-fixture.ts");
+    const sharedDirectory = path.dirname(fileURLToPath(import.meta.url));
+    const childSessionModule = path.join(sharedDirectory, "child-session.ts");
+    const subagents = path.resolve(sharedDirectory, "../subagents");
+    const workflows = path.resolve(sharedDirectory, "../workflows");
+    await Promise.all([mkdir(cwd, { recursive: true }), mkdir(agentDir)]);
+    await writeFile(
+      fixture,
+      `
+        import { isChildExtensionLoad } from ${JSON.stringify(childSessionModule)};
+        export default function (pi) {
+          const name = isChildExtensionLoad() ? "child_scope_true" : "child_scope_false";
+          pi.registerTool({
+            name, label: name, description: "scope probe",
+            parameters: { type: "object", properties: {} },
+            async execute() { return { content: [{ type: "text", text: "ok" }] }; }
+          });
+        }
+      `,
+    );
+    await writeFile(
+      path.join(agentDir, "settings.json"),
+      JSON.stringify({ extensions: [subagents, workflows, fixture] }),
+    );
+
+    const { loader, settingsManager } = await createChildResources({
+      cwd,
+      agentDir,
+      projectTrusted: false,
+    });
+    const loaded = loader.getExtensions().extensions;
+    const toolNames = loaded.flatMap((extension) => [
+      ...extension.tools.keys(),
+    ]);
+
+    assert.deepEqual(settingsManager.getExtensionPaths(), [fixture]);
+    assert.equal(
+      loaded.some((extension) =>
+        [subagents, workflows].some((blocked) =>
+          extension.resolvedPath.startsWith(blocked),
+        ),
+      ),
+      false,
+    );
+    assert.deepEqual(toolNames, ["child_scope_true"]);
+    assert.equal(
+      toolNames.some(
+        (name) => name.startsWith("subagent_") || name === "workflow",
+      ),
+      false,
+    );
+
+    const { session } = await createAgentSession({
+      cwd,
+      agentDir,
+      resourceLoader: loader,
+      settingsManager,
+      sessionManager: SessionManager.inMemory(cwd),
+      ...childToolPolicy(),
+    });
+    await bindChildSessionExtensions(session);
+    const sessionTools = new Set(
+      session.getAllTools().map((tool) => tool.name),
+    );
+    assert.equal(sessionTools.has("child_scope_true"), true);
+    assert.equal(
+      [...sessionTools].some(
+        (name) => name.startsWith("subagent_") || name === "workflow",
+      ),
+      false,
+    );
+    await shutdownAndDisposeChildSession(session);
+  });
+});
+
+test("child extension load scope remains isolated across parallel binds", async () => {
+  assert.equal(isChildExtensionLoad(), false);
+  const observations: boolean[] = [];
+  await Promise.all(
+    [1, 2, 3].map((delay) =>
+      bindChildSessionExtensions({
+        async bindExtensions() {
+          observations.push(isChildExtensionLoad());
+          await new Promise((resolve) => setTimeout(resolve, delay));
+          observations.push(isChildExtensionLoad());
+        },
+      }),
+    ),
+  );
+  assert.deepEqual(observations, [true, true, true, true, true, true]);
+  assert.equal(isChildExtensionLoad(), false);
 });
 
 test("shutdown helper bounds a stuck hook before disposal", async () => {

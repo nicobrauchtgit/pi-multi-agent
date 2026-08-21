@@ -133,6 +133,15 @@ test("settlement role updates preserve the session schema", () => {
       turns: 0,
     } satisfies SubagentSnapshot;
 
+    assert.equal(
+      roleUpsertFromSnapshot({
+        ...snapshot,
+        origin: "workflow",
+        identity: { ...snapshot.identity, origin: "workflow" },
+      }),
+      undefined,
+    );
+
     const initial = roleUpsertFromSnapshot(snapshot, { schema });
     assert.ok(initial);
     upsertRole(initial, agentDir);

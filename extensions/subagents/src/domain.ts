@@ -138,10 +138,15 @@ export type TranscriptPart =
     };
 
 export type TranscriptItem =
-  | { readonly kind: "user"; readonly text: string }
+  | {
+      readonly kind: "user";
+      readonly text: string;
+      readonly timestamp?: number;
+    }
   | {
       readonly kind: "assistant";
       readonly parts: ReadonlyArray<TranscriptPart>;
+      readonly timestamp?: number;
     }
   | {
       readonly kind: "toolResult";
@@ -149,6 +154,10 @@ export type TranscriptItem =
       readonly name: string;
       readonly isError: boolean;
       readonly outputPreview?: string;
+      readonly timestamp?: number;
+      readonly startedAt?: number;
+      readonly finishedAt?: number;
+      readonly durationMs?: number;
     };
 
 export interface LiveToolState {
@@ -232,8 +241,15 @@ export type SubagentEvent =
     }
   | {
       readonly _tag: "UsageChanged";
+      /** Latest compaction-aware context occupancy. */
       readonly tokens?: number;
       readonly contextWindow?: number;
+      /** Best-effort cumulative billing counters for the native run/session. */
+      readonly inputTokens?: number;
+      readonly outputTokens?: number;
+      readonly cacheReadTokens?: number;
+      readonly cacheWriteTokens?: number;
+      readonly costUsd?: number;
     }
   | { readonly _tag: "MetaChanged"; readonly meta: Partial<SubagentMeta> }
   /** Non-fatal diagnostics. Fatal failures arrive as a RunSettled outcome. */
@@ -272,7 +288,15 @@ export interface SubagentSnapshot {
   /** Structured-output extraction/validation failure for the current run. */
   readonly schemaError?: string;
   readonly meta: SubagentMeta;
-  readonly usage: { readonly tokens?: number; readonly contextWindow?: number };
+  readonly usage: {
+    readonly tokens?: number;
+    readonly contextWindow?: number;
+    readonly inputTokens?: number;
+    readonly outputTokens?: number;
+    readonly cacheReadTokens?: number;
+    readonly cacheWriteTokens?: number;
+    readonly costUsd?: number;
+  };
   readonly transcript: ReadonlyArray<TranscriptItem>;
   /** Streaming assistant buffers, cleared when the finalized message lands. */
   readonly liveAssistant?: { readonly text: string; readonly thinking: string };

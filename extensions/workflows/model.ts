@@ -65,6 +65,11 @@ export interface TranscriptEntry {
 
 export interface AgentRecord {
   index: number;
+  /** Manager display id (sa-N), present for C1 manager-backed agents. */
+  displayId?: string;
+  /** Durable manager-owned agent identity. */
+  agentId?: string;
+  harness?: "pi" | "claude" | "codex";
   label: string;
   phase?: string;
   state: AgentState;
@@ -74,6 +79,8 @@ export interface AgentRecord {
   startedAt: number;
   finishedAt?: number;
   error?: string;
+  /** Structured-output validation failure; values stay in the explicit agent() result. */
+  schemaError?: string;
   preview: string;
   usage: AgentUsage;
   /** Normalized, serializable subagent conversation shown by /workflows. */
@@ -96,7 +103,7 @@ export interface WorkflowDetails {
   result?: unknown;
   resultArtifact?: string;
   transcriptArtifact?: string;
-  /** Recent script-emitted log lines, bounded by the workflow runner. */
+  /** Recent script-emitted log lines, bounded by the workflow host. */
   logs: string[];
   error?: string;
 }

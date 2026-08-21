@@ -1,4 +1,7 @@
+import { AsyncLocalStorage } from "node:async_hooks";
+import * as fs from "node:fs";
 import * as path from "node:path";
+import { fileURLToPath } from "node:url";
 import {
   DefaultResourceLoader,
   getAgentDir,
@@ -9,6 +12,92 @@ import {
 } from "@earendil-works/pi-coding-agent";
 
 const CHILD_SHUTDOWN_TIMEOUT_MS = 5_000;
+const CHILD_EXTENSION_SCOPE_KEY = Symbol.for(
+  "pi-multi-agent.child-extension-load-scope.v1",
+);
+
+function childExtensionScope() {
+  const root = globalThis as typeof globalThis & {
+    [CHILD_EXTENSION_SCOPE_KEY]?: AsyncLocalStorage<boolean>;
+  };
+  return (root[CHILD_EXTENSION_SCOPE_KEY] ??= new AsyncLocalStorage<boolean>());
+}
+
+/** True only while an in-process child is loading or binding extensions. */
+export function isChildExtensionLoad() {
+  return childExtensionScope().getStore() === true;
+}
+
+function canonicalEntry(entry: string, cwd = process.cwd()) {
+  if (!path.isAbsolute(entry) && /^[a-z][a-z0-9+.-]*:/i.test(entry)) {
+    return undefined;
+  }
+  const resolved = path.resolve(cwd, entry);
+  try {
+    return fs.realpathSync.native(resolved);
+  } catch {
+    return resolved;
+  }
+}
+
+const sharedDirectory = path.dirname(fileURLToPath(import.meta.url));
+const CHILD_BLOCKED_EXTENSION_ENTRIES = [
+  path.resolve(sharedDirectory, "../subagents"),
+  path.resolve(sharedDirectory, "../subagents/index.ts"),
+  path.resolve(sharedDirectory, "../workflows"),
+  path.resolve(sharedDirectory, "../workflows/index.ts"),
+];
+
+/** Remove only this repository's orchestration entry points from child settings. */
+export function filterChildExtensionPaths(
+  extensions: ReadonlyArray<string>,
+  blockedEntries: ReadonlyArray<string> = CHILD_BLOCKED_EXTENSION_ENTRIES,
+) {
+  const blocked = new Set(
+    blockedEntries
+      .map((entry) => canonicalEntry(entry))
+      .filter((entry): entry is string => entry !== undefined),
+  );
+  return extensions.filter((entry) => {
+    const canonical = canonicalEntry(entry);
+    return canonical === undefined || !blocked.has(canonical);
+  });
+}
+
+function isAllowedChildExtensionPath(entry: string) {
+  return filterChildExtensionPaths([entry]).length === 1;
+}
+
+/**
+ * SettingsManager.reload() replaces applyOverrides(), and PackageManager reads
+ * the scoped settings rather than getExtensionPaths(). Wrap all three getters
+ * so every resource reload sees the denylist without persisting child-only
+ * settings back to the parent's settings.json.
+ */
+function installChildExtensionSettingsFilter(settingsManager: SettingsManager) {
+  const getGlobalSettings =
+    settingsManager.getGlobalSettings.bind(settingsManager);
+  const getProjectSettings =
+    settingsManager.getProjectSettings.bind(settingsManager);
+  const getExtensionPaths =
+    settingsManager.getExtensionPaths.bind(settingsManager);
+  settingsManager.getGlobalSettings = () => {
+    const settings = getGlobalSettings();
+    return {
+      ...settings,
+      extensions: filterChildExtensionPaths(settings.extensions ?? []),
+    };
+  };
+  settingsManager.getProjectSettings = () => {
+    const settings = getProjectSettings();
+    return {
+      ...settings,
+      extensions: filterChildExtensionPaths(settings.extensions ?? []),
+    };
+  };
+  settingsManager.getExtensionPaths = () =>
+    filterChildExtensionPaths(getExtensionPaths());
+}
 
 /** Tools that headless children must not receive. Everything else stays enabled. */
 export const CHILD_EXCLUDED_TOOL_NAMES = [
@@ -43,15 +132,25 @@ export async function createChildResources(options: ChildResourceOptions) {
   const settingsManager = SettingsManager.create(options.cwd, agentDir, {
     projectTrusted: options.projectTrusted,
   });
+  installChildExtensionSettingsFilter(settingsManager);
   const loader = new DefaultResourceLoader({
     cwd: options.cwd,
     agentDir,
     settingsManager,
+    // Settings filtering prevents configured orchestration entries from being
+    // resolved. The final filter also removes an auto-discovered/symlink alias;
+    // its factory runs in the child scope below and therefore returns early.
+    extensionsOverride: (base) => ({
+      ...base,
+      extensions: base.extensions.filter((extension) =>
+        isAllowedChildExtensionPath(extension.resolvedPath),
+      ),
+    }),
     ...(options.appendSystemPrompt
       ? { appendSystemPrompt: options.appendSystemPrompt }
       : {}),
   });
-  await loader.reload();
+  await childExtensionScope().run(true, () => loader.reload());
   return { loader, settingsManager };
 }
 
@@ -81,7 +180,9 @@ export function resolveStandaloneChildProjectTrust(options: {
 export async function bindChildSessionExtensions(
   session: Pick<AgentSession, "bindExtensions">,
 ) {
-  await session.bindExtensions({ mode: "print" });
+  await childExtensionScope().run(true, () =>
+    session.bindExtensions({ mode: "print" }),
+  );
 }
 
 interface ChildExtensionRunner {

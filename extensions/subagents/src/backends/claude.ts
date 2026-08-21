@@ -264,6 +264,26 @@ function resultContextWindow(result: SDKResultMessage) {
   return Object.values(result.modelUsage)[0]?.contextWindow;
 }
 
+function resultBillingUsage(result: SDKResultMessage) {
+  const values = Object.values(result.modelUsage);
+  return {
+    inputTokens: values.reduce((total, usage) => total + usage.inputTokens, 0),
+    outputTokens: values.reduce(
+      (total, usage) => total + usage.outputTokens,
+      0,
+    ),
+    cacheReadTokens: values.reduce(
+      (total, usage) => total + usage.cacheReadInputTokens,
+      0,
+    ),
+    cacheWriteTokens: values.reduce(
+      (total, usage) => total + usage.cacheCreationInputTokens,
+      0,
+    ),
+    costUsd: result.total_cost_usd,
+  };
+}
+
 export function claudeStructuredOptions(schema: unknown | undefined) {
   return {
     systemPrompt: {
@@ -496,6 +516,7 @@ const makeClaudeSession = (
       emit({
         _tag: "UsageChanged",
         contextWindow: contextWindow ?? state.meta.contextWindow,
+        ...resultBillingUsage(result),
       });
       if (
         contextWindow !== undefined &&

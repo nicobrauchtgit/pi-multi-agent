@@ -1,5 +1,8 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { truncateUtf8 } from "../shared/text.ts";
+
+export { truncateUtf8 } from "../shared/text.ts";
 
 export interface SerializationOptions {
   maxBytes?: number;
@@ -15,15 +18,6 @@ const DEFAULT_MAX_STRING_BYTES = 64 * 1024;
 
 function byteLength(value: string) {
   return Buffer.byteLength(value, "utf8");
-}
-
-export function truncateUtf8(value: string, maxBytes: number) {
-  if (maxBytes <= 0) return "";
-  if (byteLength(value) <= maxBytes) return value;
-  const buffer = Buffer.from(value, "utf8");
-  let end = Math.min(maxBytes, buffer.length);
-  while (end > 0 && (buffer[end] & 0xc0) === 0x80) end--;
-  return buffer.subarray(0, end).toString("utf8");
 }
 
 /**

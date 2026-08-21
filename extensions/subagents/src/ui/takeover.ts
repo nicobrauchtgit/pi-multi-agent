@@ -36,6 +36,13 @@ function statusGlyph(snap: SubagentSnapshot, theme: Theme): string {
   }
 }
 
+function workflowBadge(snap: SubagentSnapshot) {
+  if (snap.origin !== "workflow") return undefined;
+  return [snap.workflowRunId, snap.workflowPhase, snap.workflowLabel]
+    .filter(Boolean)
+    .join(" · ");
+}
+
 function statusWord(snap: SubagentSnapshot, theme: Theme): string {
   switch (snap.status) {
     case "running":
@@ -321,7 +328,8 @@ class SubagentDashboard implements Component {
       const title = isSelected
         ? theme.fg("accent", snap.title)
         : theme.fg("text", snap.title);
-      const left = ` ${marker} ${statusGlyph(snap, theme)} ${title} ${theme.fg("dim", snap.id)}`;
+      const ownership = workflowBadge(snap);
+      const left = ` ${marker} ${statusGlyph(snap, theme)} ${title} ${theme.fg("dim", snap.id)}${ownership ? theme.fg("muted", ` [wf ${ownership}]`) : ""}`;
 
       // Right: backend · model · context utilization · elapsed · status
       const utilization = formatContextUtilization(snap.usage);
@@ -410,6 +418,7 @@ class TakeoverView implements Component, Focusable {
       const text = value.trim();
       if (!text) return;
       this.input.setValue("");
+      if (this.snap()?.origin === "workflow") return;
       this.view.requestSend(this.id, text);
       this.scrollOffset = 0;
       this.tui.requestRender();
@@ -519,7 +528,9 @@ class TakeoverView implements Component, Focusable {
       theme.fg("muted", ` · ${snap.status} · ${formatElapsed(snap)}`) +
       (this.options?.badge
         ? theme.fg("muted", ` · ${this.options.badge}`)
-        : "") +
+        : workflowBadge(snap)
+          ? theme.fg("muted", ` · wf ${workflowBadge(snap)}`)
+          : "") +
       theme.fg("dim", ` · ${snap.backend}: ${snap.meta.modelLabel ?? "?"}`) +
       (utilization ? theme.fg("dim", ` · ${utilization}`) : "");
     lines.push(truncateToWidth(header, width));
@@ -563,12 +574,26 @@ class TakeoverView implements Component, Focusable {
     lines.push(...body.slice(0, viewport));
 
     lines.push(border);
-    lines.push(...this.input.render(width));
+    if (snap.origin === "workflow") {
+      lines.push(
+        truncateToWidth(
+          theme.fg(
+            "dim",
+            "workflow-owned agent · steering disabled; abort remains available",
+          ),
+          width,
+        ),
+      );
+    } else {
+      lines.push(...this.input.render(width));
+    }
     lines.push(
       truncateToWidth(
         theme.fg(
           "dim",
-          `${configuredKeys(this.keybindings, "tui.input.submit")} send · ${configuredKeys(this.keybindings, "app.interrupt")} back · ${configuredKeys(this.keybindings, "app.clear")} abort run · ${configuredKeys(this.keybindings, "tui.editor.cursorUp")}/${configuredKeys(this.keybindings, "tui.editor.cursorDown")} scroll · ${configuredKeys(this.keybindings, "tui.editor.pageUp")}/${configuredKeys(this.keybindings, "tui.editor.pageDown")} page`,
+          snap.origin === "workflow"
+            ? `${configuredKeys(this.keybindings, "app.interrupt")} back · ${configuredKeys(this.keybindings, "app.clear")} abort run · ${configuredKeys(this.keybindings, "tui.editor.cursorUp")}/${configuredKeys(this.keybindings, "tui.editor.cursorDown")} scroll · ${configuredKeys(this.keybindings, "tui.editor.pageUp")}/${configuredKeys(this.keybindings, "tui.editor.pageDown")} page`
+            : `${configuredKeys(this.keybindings, "tui.input.submit")} send · ${configuredKeys(this.keybindings, "app.interrupt")} back · ${configuredKeys(this.keybindings, "app.clear")} abort run · ${configuredKeys(this.keybindings, "tui.editor.cursorUp")}/${configuredKeys(this.keybindings, "tui.editor.cursorDown")} scroll · ${configuredKeys(this.keybindings, "tui.editor.pageUp")}/${configuredKeys(this.keybindings, "tui.editor.pageDown")} page`,
         ),
         width,
       ),

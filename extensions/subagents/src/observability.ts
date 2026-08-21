@@ -279,6 +279,21 @@ export function subagentEvent(
           ...(finiteCount(event.contextWindow) !== undefined
             ? { contextWindow: finiteCount(event.contextWindow) }
             : {}),
+          ...(finiteCount(event.inputTokens) !== undefined
+            ? { inputTokens: finiteCount(event.inputTokens) }
+            : {}),
+          ...(finiteCount(event.outputTokens) !== undefined
+            ? { outputTokens: finiteCount(event.outputTokens) }
+            : {}),
+          ...(finiteCount(event.cacheReadTokens) !== undefined
+            ? { cacheReadTokens: finiteCount(event.cacheReadTokens) }
+            : {}),
+          ...(finiteCount(event.cacheWriteTokens) !== undefined
+            ? { cacheWriteTokens: finiteCount(event.cacheWriteTokens) }
+            : {}),
+          ...(event.costUsd !== undefined && Number.isFinite(event.costUsd)
+            ? { costUsd: Math.max(0, event.costUsd) }
+            : {}),
         },
       });
     case "MetaChanged": {

@@ -8,15 +8,17 @@ import {
   createWorkflowPersistence,
   persistWorkflowJson,
 } from "./artifacts.ts";
+import { normalizeDetails } from "./dashboard.ts";
 import {
   emptyUsage,
+  type AgentRecord,
   type TranscriptEntry,
   type WorkflowDetails,
 } from "./model.ts";
 
 function workflowDetails(): WorkflowDetails {
   return {
-    runId: "wf_fixture",
+    runId: "wf_123456789abc",
     sessionId: "session_fixture",
     background: false,
     status: "running",
@@ -64,11 +66,14 @@ test("live artifact persistence includes current agents and transcripts", () => 
     const details = workflowDetails();
     details.agents.push({
       index: 1,
+      displayId: "sa-1",
+      agentId: "agent_11111111-1111-4111-8111-111111111111",
+      harness: "codex",
       label: "running-fixture",
       state: "running",
       startedAt: 2,
       preview: "working",
-      usage: emptyUsage(),
+      usage: { ...emptyUsage(), input: 10, output: 5, cost: 0.01 },
       transcript: [
         { role: "user", text: "current prompt" },
         {
@@ -93,6 +98,10 @@ test("live artifact persistence includes current agents and transcripts", () => 
     ) as Record<string, TranscriptEntry[]>;
     assert.equal(workflow.agents.length, 1);
     assert.equal(workflow.agents[0]?.label, "running-fixture");
+    assert.equal(workflow.agents[0]?.displayId, "sa-1");
+    assert.equal(workflow.agents[0]?.harness, "codex");
+    assert.equal("structured" in workflow.agents[0]!, false);
+    assert.equal(workflow.agents[0]?.usage.input, 10);
     assert.equal(transcripts["1"]?.[0]?.text, "current prompt");
     assert.deepEqual(
       {
@@ -108,6 +117,136 @@ test("live artifact persistence includes current agents and transcripts", () => 
         durationMs: 15,
       },
     );
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("large per-agent structured values cannot destroy workflow core state", () => {
+  const directory = mkdtempSync(join(tmpdir(), "pi-workflow-structured-"));
+  try {
+    const details = workflowDetails();
+    details.status = "completed";
+    details.finishedAt = 3;
+    for (let index = 1; index <= 20; index++) {
+      details.agents.push({
+        index,
+        label: `agent-${index}`,
+        state: "done",
+        startedAt: 1,
+        finishedAt: 2,
+        preview: "done",
+        usage: emptyUsage(),
+        transcript: [],
+        // Simulate a legacy/runtime object carrying the C1 mirror. The current
+        // AgentRecord contract intentionally omits it from workflow.json.
+        structured: { payload: "x".repeat(60 * 1024) },
+      } as AgentRecord & { structured: unknown });
+    }
+
+    persistWorkflowJson(directory, details);
+    const workflow = JSON.parse(
+      readFileSync(join(directory, "workflow.json"), "utf8"),
+    ) as WorkflowDetails & { truncated?: boolean };
+    assert.equal(workflow.truncated, undefined);
+    assert.equal(workflow.runId, details.runId);
+    assert.equal(workflow.sessionId, details.sessionId);
+    assert.equal(workflow.status, "completed");
+    assert.equal(workflow.agents.length, 20);
+    assert.ok(workflow.agents.every((agent) => !("structured" in agent)));
+    const normalized = normalizeDetails(details.runId, workflow);
+    assert.equal(normalized?.status, "completed");
+    assert.equal(normalized?.agents.length, 20);
+    assert.ok(
+      Buffer.byteLength(
+        readFileSync(join(directory, "workflow.json"), "utf8"),
+        "utf8",
+      ) <=
+        1024 * 1024,
+    );
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("workflow summary overflow degrades fields without losing core records", () => {
+  const directory = mkdtempSync(join(tmpdir(), "pi-workflow-degrade-"));
+  try {
+    const details = workflowDetails();
+    details.status = "failed";
+    details.finishedAt = 3;
+    details.error = "run-error:" + "r".repeat(64 * 1024);
+    details.description = "description:" + "d".repeat(64 * 1024);
+    details.logs = Array.from(
+      { length: 80 },
+      (_, index) => `log-${index}:` + "界".repeat(8 * 1024),
+    );
+    details.phases = Array.from({ length: 64 }, (_, index) => ({
+      title: `phase-${index}`,
+      detail: "p".repeat(8 * 1024),
+    }));
+    for (let index = 1; index <= 32; index++) {
+      details.agents.push({
+        index,
+        label: `agent-${index}`,
+        state: "error",
+        startedAt: 1,
+        finishedAt: 2,
+        preview: "v".repeat(8 * 1024),
+        error: "e".repeat(64 * 1024),
+        schemaError: "s".repeat(64 * 1024),
+        usage: emptyUsage(),
+        transcript: [],
+      });
+    }
+
+    persistWorkflowJson(directory, details);
+    const text = readFileSync(join(directory, "workflow.json"), "utf8");
+    const workflow = JSON.parse(text) as WorkflowDetails & {
+      truncated?: boolean;
+    };
+    assert.equal(workflow.truncated, undefined);
+    assert.equal(workflow.status, "failed");
+    assert.equal(workflow.agents.length, 32);
+    assert.equal(
+      workflow.agents.every((agent) => agent.state === "error"),
+      true,
+    );
+    assert.ok(
+      Buffer.byteLength(workflow.agents[0]!.error!, "utf8") <= 2 * 1024,
+    );
+    assert.ok(Buffer.byteLength(text, "utf8") <= 1024 * 1024);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("artifact persistence defensively bounds workflow metadata", () => {
+  const directory = mkdtempSync(join(tmpdir(), "pi-workflow-bounds-"));
+  try {
+    const details = workflowDetails();
+    const oversized = "界".repeat(400);
+    details.currentPhase = oversized;
+    details.phases = [{ title: oversized }];
+    details.agents.push({
+      index: 1,
+      label: oversized,
+      phase: oversized,
+      state: "done",
+      startedAt: 1,
+      finishedAt: 2,
+      preview: "done",
+      usage: emptyUsage(),
+      transcript: [],
+    });
+    persistWorkflowJson(directory, details);
+    const workflow = JSON.parse(
+      readFileSync(join(directory, "workflow.json"), "utf8"),
+    ) as WorkflowDetails;
+    assert.ok(Buffer.byteLength(workflow.currentPhase!, "utf8") <= 256);
+    assert.ok(Buffer.byteLength(workflow.phases[0]!.title, "utf8") <= 256);
+    assert.ok(Buffer.byteLength(workflow.agents[0]!.label, "utf8") <= 256);
+    assert.ok(Buffer.byteLength(workflow.agents[0]!.phase!, "utf8") <= 256);
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }

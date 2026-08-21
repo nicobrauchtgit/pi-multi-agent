@@ -170,6 +170,11 @@ const makeStubSession = (
           _tag: "UsageChanged",
           tokens: Math.min(profile.contextWindow, 2400 * (turn + 1)),
           contextWindow: profile.contextWindow,
+          inputTokens: 2_000 * (turn + 1),
+          outputTokens: 400 * (turn + 1),
+          cacheReadTokens: 200 * turn,
+          cacheWriteTokens: 100 * turn,
+          costUsd: 0.001 * (turn + 1),
         });
 
         if (failing || schemaFailing) {
@@ -206,6 +211,11 @@ const makeStubSession = (
           _tag: "UsageChanged",
           tokens: Math.min(profile.contextWindow, 2400 * (turn + 1) + 900),
           contextWindow: profile.contextWindow,
+          inputTokens: 2_000 * (turn + 1),
+          outputTokens: 900 * (turn + 1),
+          cacheReadTokens: 200 * turn,
+          cacheWriteTokens: 100 * turn,
+          costUsd: 0.002 * (turn + 1),
         });
         yield* emit({
           _tag: "RunSettled",

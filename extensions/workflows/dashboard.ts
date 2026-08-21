@@ -26,6 +26,12 @@ import {
   wrapTextWithAnsi,
   type TUI,
 } from "@earendil-works/pi-tui";
+import { isAgentId, isWorkflowRunId } from "../shared/observability/ids.ts";
+import { truncateUtf8 } from "../shared/text.ts";
+import {
+  WORKFLOW_AGENT_INDEX_MAX,
+  WORKFLOW_METADATA_TEXT_MAX_BYTES,
+} from "../shared/workflow-metadata.ts";
 import {
   agentContext,
   countStates,
@@ -89,6 +95,14 @@ function normalizeTranscript(value: unknown): TranscriptEntry[] {
       isError: entry.isError === true,
       timestamp:
         typeof entry.timestamp === "number" ? entry.timestamp : undefined,
+      toolCallId:
+        typeof entry.toolCallId === "string" ? entry.toolCallId : undefined,
+      startedAt:
+        typeof entry.startedAt === "number" ? entry.startedAt : undefined,
+      finishedAt:
+        typeof entry.finishedAt === "number" ? entry.finishedAt : undefined,
+      durationMs:
+        typeof entry.durationMs === "number" ? entry.durationMs : undefined,
     });
   }
   return transcript;
@@ -99,8 +113,31 @@ function normalizeLogs(value: unknown): string[] {
   return value.filter((item): item is string => typeof item === "string");
 }
 
+function nonNegativeNumber(value: unknown) {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0
+    ? value
+    : 0;
+}
+
+function normalizeUsage(value: unknown): AgentRecord["usage"] {
+  const usage =
+    value && typeof value === "object"
+      ? (value as Record<string, unknown>)
+      : {};
+  const contextTokens = nonNegativeNumber(usage.contextTokens);
+  return {
+    input: nonNegativeNumber(usage.input),
+    output: nonNegativeNumber(usage.output),
+    cacheRead: nonNegativeNumber(usage.cacheRead),
+    cacheWrite: nonNegativeNumber(usage.cacheWrite),
+    cost: nonNegativeNumber(usage.cost),
+    turns: Math.floor(nonNegativeNumber(usage.turns)),
+    ...(contextTokens > 0 ? { contextTokens } : {}),
+  };
+}
+
 /** Leniently normalize a workflow.json (including runs from older tooling). */
-function normalizeDetails(
+export function normalizeDetails(
   runId: string,
   raw: unknown,
 ): WorkflowDetails | undefined {
@@ -120,11 +157,36 @@ function normalizeDetails(
         : a.state === "running"
           ? "running"
           : "done";
+    const fallbackIndex = Math.min(WORKFLOW_AGENT_INDEX_MAX, agents.length + 1);
+    const index =
+      typeof a.index === "number" &&
+      Number.isSafeInteger(a.index) &&
+      a.index >= 1 &&
+      a.index <= WORKFLOW_AGENT_INDEX_MAX
+        ? a.index
+        : fallbackIndex;
     agents.push({
-      index: typeof a.index === "number" ? a.index : agents.length + 1,
+      index,
+      displayId:
+        typeof a.displayId === "string" && /^sa-[1-9][0-9]*$/.test(a.displayId)
+          ? a.displayId
+          : undefined,
+      agentId:
+        typeof a.agentId === "string" && isAgentId(a.agentId)
+          ? a.agentId
+          : undefined,
+      harness:
+        a.harness === "pi" || a.harness === "claude" || a.harness === "codex"
+          ? a.harness
+          : undefined,
       label:
-        typeof a.label === "string" ? a.label : `agent-${agents.length + 1}`,
-      phase: typeof a.phase === "string" ? a.phase : undefined,
+        typeof a.label === "string"
+          ? truncateUtf8(a.label, WORKFLOW_METADATA_TEXT_MAX_BYTES)
+          : `agent-${index}`,
+      phase:
+        typeof a.phase === "string"
+          ? truncateUtf8(a.phase, WORKFLOW_METADATA_TEXT_MAX_BYTES)
+          : undefined,
       state,
       model: typeof a.model === "string" ? a.model : undefined,
       contextWindow:
@@ -139,16 +201,10 @@ function normalizeDetails(
         typeof a.error === "string" && a.error !== "[undefined]"
           ? a.error
           : undefined,
+      schemaError:
+        typeof a.schemaError === "string" ? a.schemaError : undefined,
       preview: typeof a.preview === "string" ? a.preview : "",
-      usage: {
-        input: 0,
-        output: 0,
-        cacheRead: 0,
-        cacheWrite: 0,
-        cost: 0,
-        turns: 0,
-        ...(a.usage && typeof a.usage === "object" ? (a.usage as object) : {}),
-      },
+      usage: normalizeUsage(a.usage),
       transcript: normalizeTranscript(a.transcript),
     });
   }
@@ -164,8 +220,12 @@ function normalizeDetails(
     const p = item as Record<string, unknown>;
     if (typeof p.title !== "string") continue;
     phases.push({
-      title: p.title,
-      ...(typeof p.detail === "string" ? { detail: p.detail } : {}),
+      title: truncateUtf8(p.title, WORKFLOW_METADATA_TEXT_MAX_BYTES),
+      ...(typeof p.detail === "string"
+        ? {
+            detail: truncateUtf8(p.detail, WORKFLOW_METADATA_TEXT_MAX_BYTES),
+          }
+        : {}),
     });
   }
 
@@ -199,7 +259,9 @@ function normalizeDetails(
       typeof record.finishedAt === "number" ? record.finishedAt : undefined,
     phases,
     currentPhase:
-      typeof record.currentPhase === "string" ? record.currentPhase : undefined,
+      typeof record.currentPhase === "string"
+        ? truncateUtf8(record.currentPhase, WORKFLOW_METADATA_TEXT_MAX_BYTES)
+        : undefined,
     agents,
     result: record.result,
     resultArtifact:
@@ -240,7 +302,7 @@ export function loadRunEntries(
 ): RunEntry[] {
   let names: string[] = [];
   try {
-    names = fs.readdirSync(runsDir()).filter((name) => name.startsWith("wf_"));
+    names = fs.readdirSync(runsDir()).filter(isWorkflowRunId);
   } catch {
     // No runs yet.
   }
@@ -340,6 +402,8 @@ function buildReport(details: WorkflowDetails): string {
             ? "FAILED"
             : "running";
       const stats = [
+        agent.displayId,
+        agent.harness,
         agent.model,
         agentContext(agent),
         formatElapsed(agent.startedAt, agent.finishedAt),
@@ -857,7 +921,12 @@ export class WorkflowDashboard {
           selected && this.detailFocus === "agents"
             ? theme.fg("accent", "❯")
             : " ";
-        const stats = [agent.model, agentContext(agent)]
+        const stats = [
+          agent.displayId,
+          agent.harness,
+          agent.model,
+          agentContext(agent),
+        ]
           .filter(Boolean)
           .join(" · ");
         const label =
@@ -980,6 +1049,8 @@ export class WorkflowDashboard {
     const right = theme.fg(
       "dim",
       [
+        agent.displayId,
+        agent.harness,
         agent.model,
         agentContext(agent),
         formatElapsed(agent.startedAt, agent.finishedAt),

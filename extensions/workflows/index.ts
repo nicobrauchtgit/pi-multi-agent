@@ -8,7 +8,7 @@
  *   export const meta = { name, description, phases: [{ title, detail? }] }
  *   phase(title)                                  // mark runtime phase progression
  *   log(message)                                  // append a bounded script log line
- *   await agent(prompt, { label?, phase?, schema?, model?, provider?, effort? })
+ *   await agent(prompt, { harness?, label?, phase?, schema?, model?, provider?, effort? })
  *   await parallel([() => agent(...), ...], { concurrency? })
  *   await pipeline(items, stageFn, ...)           // per-item sequential stages, items fan out
  *   args, cwd, process.cwd()                      // tool args and parent cwd
@@ -36,10 +36,25 @@ import {
 import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type, type Static } from "typebox";
 import { formatActivityStatus } from "../shared/activity-status.ts";
+import { isChildExtensionLoad } from "../shared/child-session.ts";
 import {
-  NOOP_OBSERVABILITY_SINK,
-  type ObservabilitySink,
-} from "../shared/observability/sink.ts";
+  isWorkflowRunId,
+  parentIdentityFromPiSession,
+} from "../shared/observability/ids.ts";
+import {
+  acquireProcessService,
+  type ProcessServiceHandle,
+} from "../shared/service-registry.ts";
+import { truncateUtf8 } from "../shared/text.ts";
+import { WORKFLOW_METADATA_TEXT_MAX_BYTES } from "../shared/workflow-metadata.ts";
+import type { ParentContext } from "../subagents/src/domain.ts";
+import type { SubagentManagerShape } from "../subagents/src/manager.ts";
+import type { SubagentRuntime } from "../subagents/src/runtime.ts";
+import {
+  executeManagerWorkflowAgent,
+  type ScriptAgentResult,
+  type WorkflowAgentCallOptions,
+} from "./agent-bridge.ts";
 import { createWorkflowPersistence, persistWorkflowJson } from "./artifacts.ts";
 import { RunController } from "./controller.ts";
 import { sessionWorkflowRunIds, showWorkflowDashboard } from "./dashboard.ts";
@@ -70,52 +85,17 @@ import {
 import {
   buildBackgroundWorkflowFollowUp,
   buildBackgroundWorkflowLaunchResult,
-  buildWorkflowAgentPrompt,
   buildWorkflowResultMessage,
   WORKFLOW_PARAMETER_DESCRIPTIONS,
   WORKFLOW_PROMPT_GUIDELINES,
   WORKFLOW_PROMPT_SNIPPET,
   WORKFLOW_TOOL_DESCRIPTION,
 } from "./prompt.ts";
-import {
-  createWorkflowResources,
-  runAgent,
-  type ThinkingLevel,
-  type WorkflowModel,
-} from "./runner.ts";
 import { runWorkflowSandbox } from "./sandbox.ts";
 import { safeStringify, writeFileAtomic } from "./serialization.ts";
 
-const PREVIEW_LENGTH = 200;
 const EMIT_INTERVAL_MS = 120;
 const RESULT_LOG_LINES = 8;
-
-const THINKING_LEVELS = [
-  "off",
-  "minimal",
-  "low",
-  "medium",
-  "high",
-  "xhigh",
-  "max",
-] as const;
-
-/** What `agent()` resolves to inside the script. */
-interface ScriptAgentResult {
-  ok: boolean;
-  output: string;
-  structured?: unknown;
-  error?: string;
-}
-
-interface AgentCallOptions {
-  label?: unknown;
-  phase?: unknown;
-  schema?: unknown;
-  model?: unknown;
-  provider?: unknown;
-  effort?: unknown;
-}
 
 const WorkflowParams = Type.Object({
   script: Type.String({
@@ -187,7 +167,7 @@ function listRuns(
   const base = path.join(getAgentDir(), "workflows");
   let names: string[] = [];
   try {
-    names = fs.readdirSync(base).filter((name) => name.startsWith("wf_"));
+    names = fs.readdirSync(base).filter(isWorkflowRunId);
   } catch {
     // No runs yet.
   }
@@ -251,10 +231,8 @@ function runDetailText(
   }
 }
 
-export default function workflows(
-  pi: ExtensionAPI,
-  observabilitySink: ObservabilitySink = NOOP_OBSERVABILITY_SINK,
-) {
+export default function workflows(pi: ExtensionAPI) {
+  if (isChildExtensionLoad()) return;
   /** Live background runs, for /workflows and shutdown cleanup. */
   const activeRuns = new Map<
     string,
@@ -403,6 +381,13 @@ export default function workflows(
         }
       }
 
+      let service: ProcessServiceHandle<SubagentRuntime, SubagentManagerShape>;
+      try {
+        service = await acquireProcessService({ timeoutMs: 1_000 });
+      } catch (error) {
+        throw new Error(`Workflow cannot start: ${errorText(error)}`);
+      }
+
       const meta = prepared.meta;
       const runId = `wf_${randomBytes(6).toString("hex")}`;
       const runDir = path.join(getAgentDir(), "workflows", runId);
@@ -416,7 +401,17 @@ export default function workflows(
         background,
         status: "running",
         startedAt: Date.now(),
-        phases: [...meta.phases],
+        phases: meta.phases.map((phase) => ({
+          title: truncateUtf8(phase.title, WORKFLOW_METADATA_TEXT_MAX_BYTES),
+          ...(phase.detail
+            ? {
+                detail: truncateUtf8(
+                  phase.detail,
+                  WORKFLOW_METADATA_TEXT_MAX_BYTES,
+                ),
+              }
+            : {}),
+        })),
         agents: [],
         logs: [],
       };
@@ -424,7 +419,7 @@ export default function workflows(
         runId,
         sessionId: details.sessionId,
         cwd: ctx.cwd,
-        sink: observabilitySink,
+        sink: service.sink,
       });
 
       writeRunFile(runDir, "script.js", params.script);
@@ -436,16 +431,26 @@ export default function workflows(
       // Background runs survive Esc on the parent turn, but all runs are
       // aborted and settled during session shutdown.
       const controller = new RunController(background ? undefined : signal);
+      const onServiceShutdown = () =>
+        controller.abort("Subagent service was reloaded");
+      service.shutdownSignal.addEventListener("abort", onServiceShutdown, {
+        once: true,
+      });
+      if (service.shutdownSignal.aborted) onServiceShutdown();
 
-      // Each concurrent child gets its own extension runtime. All children use
-      // the parent cwd and live trust decision.
-      const projectTrusted = ctx.isProjectTrusted();
-      const getResources = (structured: boolean) =>
-        createWorkflowResources(
-          ctx.cwd,
-          structured ? "structured" : "plain",
-          projectTrusted,
-        );
+      // Capture only run-scoped values. Extension contexts are replaced on
+      // /reload and must never be retained by background work.
+      const parentContext: ParentContext = {
+        parentCwd: ctx.cwd,
+        ...parentIdentityFromPiSession(ctx.sessionManager.getSessionId()),
+        projectTrusted: ctx.isProjectTrusted(),
+        inheritedModel: ctx.model
+          ? { provider: ctx.model.provider, id: ctx.model.id }
+          : undefined,
+        inheritedThinkingLevel: pi.getThinkingLevel(),
+        modelRegistry: ctx.modelRegistry,
+      };
+      const runCwd = ctx.cwd;
 
       // Throttled progress: tool-block updates when blocking. Background
       // runs are covered by the below-editor indicator and /workflows.
@@ -487,7 +492,10 @@ export default function workflows(
       };
 
       const phaseFn = (title: unknown) => {
-        const text = String(title);
+        const text = truncateUtf8(
+          String(title),
+          WORKFLOW_METADATA_TEXT_MAX_BYTES,
+        );
         details.currentPhase = text;
         if (!details.phases.some((p) => p.title === text))
           details.phases.push({ title: text });
@@ -502,25 +510,23 @@ export default function workflows(
         invocationSignal?: AbortSignal,
       ): Promise<ScriptAgentResult> => {
         const index = ++agentCounter;
-        const opts: AgentCallOptions =
+        const opts: WorkflowAgentCallOptions =
           optsValue && typeof optsValue === "object"
-            ? (optsValue as AgentCallOptions)
+            ? (optsValue as WorkflowAgentCallOptions)
             : {};
         const label =
           typeof opts.label === "string" && opts.label.trim()
-            ? opts.label.trim().slice(0, 160)
+            ? truncateUtf8(opts.label.trim(), WORKFLOW_METADATA_TEXT_MAX_BYTES)
             : `agent-${index}`;
-
+        const phase =
+          typeof opts.phase === "string"
+            ? truncateUtf8(opts.phase, WORKFLOW_METADATA_TEXT_MAX_BYTES)
+            : details.currentPhase;
         const record: AgentRecord = {
           index,
           label,
-          phase:
-            typeof opts.phase === "string"
-              ? opts.phase.slice(0, 160)
-              : details.currentPhase,
+          ...(phase === undefined ? {} : { phase }),
           state: "running",
-          model: ctx.model?.id,
-          contextWindow: ctx.model?.contextWindow,
           startedAt: Date.now(),
           preview: "",
           usage: emptyUsage(),
@@ -530,128 +536,33 @@ export default function workflows(
         persistence.checkpoint({ immediate: true });
         emit(false);
 
-        const fail = (error: string): ScriptAgentResult => {
+        const fail = (error: unknown): ScriptAgentResult => {
+          const message = errorText(error);
           record.state = "error";
-          record.error = error;
+          record.error = message;
           record.finishedAt = Date.now();
           emit();
-          return { ok: false, output: "", error };
+          return { ok: false, output: "", error: message };
         };
-
-        const prompt = buildWorkflowAgentPrompt(
-          typeof promptValue === "string"
-            ? promptValue
-            : String(promptValue ?? ""),
-        );
-        if (!prompt.trim())
-          return fail("agent() requires a non-empty prompt string");
-        if (controller.signal.aborted)
+        if (controller.signal.aborted) {
           return fail("Workflow was aborted before this agent started");
+        }
 
         return controller
-          .schedule(async (runSignal) => {
-            // Model/provider resolution: default to the parent session's model.
-            let model: WorkflowModel | undefined = ctx.model;
-            if (opts.model !== undefined || opts.provider !== undefined) {
-              const modelOpt =
-                typeof opts.model === "string" ? opts.model : undefined;
-              const providerOpt =
-                typeof opts.provider === "string" ? opts.provider : undefined;
-              if (!modelOpt)
-                return fail(
-                  `agent "${label}": \`provider\` requires \`model\` as well`,
-                );
-              let resolved: WorkflowModel | undefined;
-              if (providerOpt) {
-                resolved = ctx.modelRegistry.find(providerOpt, modelOpt);
-              } else {
-                const slash = modelOpt.indexOf("/");
-                if (slash > 0) {
-                  resolved = ctx.modelRegistry.find(
-                    modelOpt.slice(0, slash),
-                    modelOpt.slice(slash + 1),
-                  );
-                }
-                resolved ??= ctx.modelRegistry
-                  .getAll()
-                  .find((m) => m.id === modelOpt);
-              }
-              if (!resolved) {
-                const requested = providerOpt
-                  ? `${providerOpt}/${modelOpt}`
-                  : modelOpt;
-                return fail(
-                  `agent "${label}": unknown model "${requested}" (use provider/id)`,
-                );
-              }
-              model = resolved;
-            }
-            record.model = model?.id;
-            record.contextWindow = model?.contextWindow;
-            emit();
-
-            // Effort → thinking level; default inherits the parent session.
-            let thinkingLevel: ThinkingLevel = pi.getThinkingLevel();
-            if (opts.effort !== undefined) {
-              const effort = String(opts.effort);
-              if (!(THINKING_LEVELS as readonly string[]).includes(effort)) {
-                return fail(
-                  `agent "${label}": invalid effort "${effort}" (use ${THINKING_LEVELS.join("|")})`,
-                );
-              }
-              thinkingLevel = effort as ThinkingLevel;
-            }
-
-            const resources = await getResources(opts.schema !== undefined);
-            const outcome = await runAgent({
-              prompt,
-              schema: opts.schema,
-              model,
-              thinkingLevel,
-              cwd: ctx.cwd,
-              loader: resources.loader,
-              settingsManager: resources.settingsManager,
-              modelRegistry: ctx.modelRegistry,
-              signal: runSignal,
-              onProgress: (progress) => {
-                record.preview = progress.preview.slice(0, PREVIEW_LENGTH);
-                record.usage = progress.usage;
-                record.model = progress.model ?? record.model;
-                record.contextWindow =
-                  progress.contextWindow ?? record.contextWindow;
-                record.transcript = progress.transcript;
-                emit();
-              },
-            });
-
-            record.usage = outcome.usage;
-            record.model = outcome.model ?? record.model;
-            record.contextWindow =
-              outcome.contextWindow ?? record.contextWindow;
-            record.transcript = outcome.transcript;
-            record.preview = (outcome.output || record.preview).slice(
-              0,
-              PREVIEW_LENGTH,
-            );
-            record.finishedAt = Date.now();
-            record.state = outcome.ok ? "done" : "error";
-            if (outcome.ok) {
-              delete record.error;
-            } else {
-              record.error = outcome.error ?? "Agent failed";
-            }
-            emit();
-
-            return {
-              ok: outcome.ok,
-              output: outcome.output,
-              ...(outcome.structured !== undefined
-                ? { structured: outcome.structured }
-                : {}),
-              ...(outcome.error !== undefined ? { error: outcome.error } : {}),
-            };
-          }, invocationSignal)
-          .catch((error) => fail(errorText(error)));
+          .schedule(
+            (runSignal) =>
+              executeManagerWorkflowAgent(promptValue, opts, {
+                service,
+                runId,
+                cwd: runCwd,
+                parent: parentContext,
+                record,
+                signal: runSignal,
+                onUpdate: emit,
+              }),
+            invocationSignal,
+          )
+          .catch(fail);
       };
 
       const runScript = async () => {
@@ -661,7 +572,7 @@ export default function workflows(
             const sandboxOptions = {
               source: prepared.source,
               args,
-              cwd: ctx.cwd,
+              cwd: runCwd,
               signal: controller.signal,
               onAgent: agentFn,
               onPhase: phaseFn,
@@ -710,6 +621,10 @@ export default function workflows(
             details.finishedAt = Date.now();
             details.error ??= "Workflow terminated before normal settlement";
           }
+          service.shutdownSignal.removeEventListener(
+            "abort",
+            onServiceShutdown,
+          );
           workflowEvents.settled(details);
           flushNow();
         }
@@ -849,7 +764,7 @@ export default function workflows(
             agent.phase ? theme.fg("dim", ` (${agent.phase})`) : ""
           }${theme.fg(
             "dim",
-            `${context ? ` · ${context}` : ""} · ${formatElapsed(agent.startedAt, agent.finishedAt)}`,
+            `${agent.displayId ? ` · ${agent.displayId}` : ""}${agent.harness ? ` · ${agent.harness}` : ""}${context ? ` · ${context}` : ""} · ${formatElapsed(agent.startedAt, agent.finishedAt)}`,
           )}`;
         }
         if (totals) text += `\n  ${theme.fg("dim", `Total: ${totals}`)}`;
@@ -882,7 +797,12 @@ export default function workflows(
           new Text(theme.fg("muted", `─── ${group.title} ───`), 0, 0),
         );
         for (const agent of group.agents) {
-          const usage = formatUsage(agent.usage, agent.model);
+          const usage = formatUsage(
+            agent.usage,
+            [agent.displayId, agent.harness, agent.model]
+              .filter(Boolean)
+              .join(" · "),
+          );
           const context = agentContext(agent);
           let line = `${stateSquare(agent.state, theme)} ${theme.fg("accent", agent.label)} ${theme.fg(
             "dim",

@@ -11,6 +11,7 @@ const MAX_AGENT_MESSAGE_BYTES = 512 * 1024;
 const MAX_AGENT_REQUESTS = 32;
 
 export interface SandboxAgentOptions {
+  harness?: unknown;
   label?: unknown;
   phase?: unknown;
   schema?: unknown;
@@ -65,6 +66,7 @@ function terminateChild(child: ChildProcess) {
 function sanitizeAgentOptions(value: unknown): SandboxAgentOptions {
   if (!isRecord(value)) return {};
   return {
+    ...(value.harness !== undefined ? { harness: value.harness } : {}),
     ...(value.label !== undefined ? { label: value.label } : {}),
     ...(value.phase !== undefined ? { phase: value.phase } : {}),
     ...(value.schema !== undefined ? { schema: value.schema } : {}),

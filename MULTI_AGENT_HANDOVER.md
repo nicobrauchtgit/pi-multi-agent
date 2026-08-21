@@ -1,6 +1,6 @@
 # Multi-Agent Setup — Handover
 
-_Last updated: 2026-08-21_
+_Last updated: 2026-08-22_
 
 This is the current handover for the Pi multi-agent repository under:
 
@@ -77,7 +77,7 @@ extensions/subagents/
   index.ts                         tool/command registration, parent API boundary
   src/domain.ts                    BackendName, SpawnTask, SubagentEvent, SubagentSnapshot
   src/backend.ts                   SubagentBackend/SubagentSession interfaces
-  src/manager.ts                   SubagentManager, live registry, wait/cancel/send, snapshots
+  src/manager.ts                   SubagentManager, live registry, workflow admission/atomic collect, wait/cancel/send, snapshots
   src/backends/pi.ts               in-process Pi SDK AgentSession backend
   src/backends/claude.ts           Claude Agent SDK streaming-input backend
   src/backends/codex.ts            codex app-server JSON-RPC backend
@@ -89,11 +89,11 @@ extensions/subagents/
   src/ui/transcript.ts             transcript rendering
 
 extensions/workflows/
-  index.ts                         workflow tool, /workflows command, progress/UI wiring
+  index.ts                         workflow tool, /workflows command, process-service consumer, progress/UI wiring
   sandbox.ts                       permission-mode child process IPC host
   sandbox-child.cjs                VM DSL bootstrap inside restricted child
   controller.ts                    run-wide agent scheduling/cancellation cap
-  runner.ts                        workflow child Pi AgentSession runner
+  agent-bridge.ts                  manager-backed workflow agent adapter, watchdog, snapshot projection
   model.ts                         WorkflowDetails + formatting helpers
   prompt.ts                        model-facing workflow DSL guidance
   dashboard.ts                     /workflows dashboard
@@ -102,7 +102,10 @@ extensions/workflows/
   serialization.ts                 bounded JSON/atomic writes
 
 extensions/shared/
-  child-session.ts                 trust-aware child resources, tool denylist, shutdown
+  child-session.ts                 trust-aware child resources, child-load scope/filter, tool denylist, shutdown
+  service-registry.ts              versioned globalThis manager/runtime/sink ownership boundary
+  workflow-metadata.ts             workflow ownership validation and UTF-8 bounds
+  text.ts                          shared UTF-8-safe truncation
   json-schema.ts                   bounded JSON Schema guard + TypeBox adapter
   structured-output.ts             terminating Pi structured_output tool
   tool-call-timeout.ts             bounded child tool execution guard
@@ -112,23 +115,20 @@ extensions/shared/
   dashboard-state.ts
 ```
 
-### Two spawn paths still exist
+### One manager-owned agent path
 
-This is the most important architectural caveat:
+Task C1 is complete. Standalone and workflow-owned agents now share one process-owned runtime:
 
 ```text
-Standalone subagents
-  -> SubagentManager
-  -> pi / claude / codex backends
-  -> rich live events, steering, follow-up, roles
-
-Workflow agent()
-  -> workflows/runner.ts
-  -> in-process Pi child sessions only
-  -> structured output, artifacts, workflow progress
+Standalone tools ─┐
+                  ├─> SubagentManager ─> pi / claude / codex backends
+Workflow agent() ─┘          │
+                             └─> one agent lifecycle/event vocabulary
 ```
 
-Task C groundwork and C0 are implemented: manager snapshots carry workflow ownership metadata and durable identity, workflow-origin settlements suppress standalone parent delivery, manager wait/get seams support a future bridge, and bounded run/agent observability events flow through a default no-op sink. This does **not** unify execution: workflow `agent()` still uses the legacy Pi-only runner, so C1 execution unification remains not started.
+`extensions/subagents/index.ts` is the sole provider of the manager, managed runtime, and observability sink. `extensions/workflows/index.ts` resolves that service lazily through the versioned `globalThis` registry, so separately evaluated extension modules and load order do not create duplicate managers. Owner token, epoch, and shutdown signal cover reload/session replacement. In-process Pi child resource reloads run inside a global `AsyncLocalStorage` scope, PackageManager's scoped settings getters are exact-realpath filtered, and the final loaded extension set is filtered again; children therefore neither load the orchestration entries nor acquire the parent service.
+
+Workflow run events remain run-level only. Every workflow agent lifecycle event, snapshot, cancellation, and settlement is manager-owned. The old workflow child runner and its tests are deleted with no fallback flag.
 
 ---
 
@@ -275,6 +275,22 @@ process.cwd()
 
 No `budget` global exists by design.
 
+Workflow `agent()` is manager-backed and accepts:
+
+```js
+await agent("review this", {
+  harness: "pi" | "claude" | "codex", // defaults to pi
+  model: "backend-specific model hint",
+  provider: "pi-only compatibility provider",
+  effort: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max",
+  schema: OBJECT_ROOT_JSON_SCHEMA,
+  label: "bounded display label",
+  phase: "bounded phase",
+});
+```
+
+Pi model hints use `provider/id` or a resolvable bare id; the existing separate `provider` option remains as a Pi-only migration shim. Claude uses its native alias and Codex uses its model slug. Structured results, trust gating, Hunk prompts, child deny-lists, context/usage/transcript projection, and cancellation all flow through the same backend implementations as standalone agents. Workflow agents are role-less, visible in both TUIs, hidden from standalone model-facing subagent tools, and never auto-deliver a second parent follow-up.
+
 `meta.phases` is optional documentation. Runtime progress is driven by `phase(title)`.
 
 `pipeline(items, ...stages)` semantics:
@@ -300,7 +316,7 @@ Workflow run artifacts are saved under:
   args.json              when args were supplied
   workflow.json          compact run state
   result.json            when result exists
-  transcripts.json       bounded child transcripts
+  transcripts.json       bounded manager transcript/UI previews
 ```
 
 Workflows have no resume yet. Failed runs are rerun/repaired manually for now.
@@ -466,8 +482,8 @@ Implemented and verified:
   metadata, usage/meta/error, and settlement without storing prompts,
   transcript bodies, tool arguments/results, or streaming deltas;
 - workflow code emits only `workflow.started`, `workflow.phase`,
-  `workflow.log`, and `workflow.settled`; it emits no agent lifecycle events and
-  still uses the legacy runner until C1;
+  `workflow.log`, and `workflow.settled`; it emits no agent lifecycle events.
+  At the C0 checkpoint execution still used the old runner; C1 below removed it;
 - `WorkflowDetails` and manager snapshots remain the live in-memory TUI
   projections, and observability failures cannot affect lifecycle or returns;
 - deterministic identity/order/bounds/fault-isolation tests and all repository
@@ -479,52 +495,54 @@ The production sink remains no-op until the later staged producer/storage work.
 
 ---
 
-### Task C1 — Unify workflow `agent()` with `SubagentManager` — not started
+### Task C1 — Unify workflow `agent()` with `SubagentManager` — completed 2026-08-22
 
-Goal: workflow scripts can choose harness:
+Implemented and verified:
 
-```js
-await agent("review this", {
-  label: "codex review",
-  harness: "codex",
-  model: "gpt-5.6-sol",
-  effort: "high",
-  schema: FINDINGS,
-});
-```
+- `subagents/index.ts` owns one runtime, manager, and sink through a versioned
+  `globalThis` registry that survives separate jiti module evaluation;
+- workflows acquire the current epoch lazily, abort on reload/session
+  replacement, and never capture a stale extension context or create a private
+  runner;
+- child Pi resource loading runs inside the global `AsyncLocalStorage` scope,
+  exact-realpath filtering is applied to the scoped settings PackageManager
+  actually reads, and a final loaded-extension filter provides defense in depth;
+- `runWorkflowAgent()` combines FIFO global admission, durable reservation,
+  pruning pin, settlement wait, and frozen bounded result copy; high-fanout
+  churn cannot remove a result between wait and collection;
+- workflow metadata is validated and UTF-8-byte-bounded before snapshots,
+  events, artifacts, or TUI rendering; workflow roles/resume/send are rejected
+  and persistence is additionally origin-gated;
+- the DSL supports Pi, Claude, and Codex, backend-specific model hints, a
+  shared effort scale, structured schemas, labels, and phases; Pi's provider
+  option remains a documented migration shim;
+- workflow cancellation, invocation cancellation, service replacement, and
+  shutdown cancel admission waiters, active native work, and spawn races, then
+  wait for cleanup within existing bounds;
+- `/workflows` mirrors manager model/context/usage/preview/transcript/tool timing
+  and state/schema errors while preserving workflow.json, result.json,
+  transcripts.json, and explicit script returns; validated per-agent structured
+  values stay in the explicit `agent()` result instead of being duplicated into
+  every UI/checkpoint record;
+- `/subagents` shows workflow ownership and permits abort but not steering;
+  standalone model-facing tools still filter workflow origin;
+- workflow origin forces `autoDeliver: false`; manager settlement cannot enqueue
+  a duplicate parent message;
+- `workflows/runner.ts` and its tests are deleted. Static removal tests reject
+  Pi session constructors, runner calls, a fallback execution flag, or a second
+  factory argument in workflow production code.
 
-Required behavior:
+Acceptance evidence:
 
-- consume the existing `SubagentOrigin: "workflow"` groundwork;
-- have the workflow bridge attach bounded durable `workflowRunId`, workflow
-  phase/index/label, and forced `autoDeliver: false` metadata before backend
-  spawn;
-- route workflow `agentFn` through the manager and wait for manager settlement;
-- return `{ ok, output, structured?, error? }` to the workflow script;
-- suppress standalone result follow-ups for workflow-owned agents;
-- propagate workflow cancellation and shutdown to manager cancellation;
-- keep phase/status/preview/usage/transcript visible in `/workflows`;
-- show workflow-owned agents in `/subagents` with origin/workflow identity;
-- support Pi, Claude, and Codex plus model/effort/schema selection.
+- hermetic service lifecycle, duplicate-module, admission, high-churn,
+  cancellation, metadata, bridge, sandbox, dashboard, and artifact tests pass;
+- the full default test/check/format/smoke/startup gate passes;
+- the opt-in live workflow suite completes one structured Pi/Claude/Codex DSL
+  matrix and one real Codex cancellation with settled artifacts.
 
-The current Pi-only runner may exist only as temporary implementation scaffolding
-inside C1. C1 acceptance requires deleting/retiring that execution path and any
-fallback flag. **No Task D database work may start while both paths can run.**
-Downstream consumers must see one manager-owned agent event vocabulary.
-
-Durable IDs/origin must be available before child work starts or observed at the
-manager boundary. Do not claim exact Pi child-hook attribution through a
-post-construction map or process-wide environment variable; defer child-hook
-claiming until a non-racy per-session API exists.
-
-Acceptance:
-
-- workflow scripts run Pi/Claude/Codex children;
-- workflow explicit return values remain the source of truth;
-- no duplicate parent follow-up is delivered;
-- cancellation aborts workflow-owned manager agents;
-- both dashboards retain their current information;
-- repository tests/search prove the legacy runner cannot execute an agent.
+Task D may now begin as a separate task. C1 did not add a daemon, SQLite,
+network/spool storage, redaction, web UI, diff capture, or observability
+persistence.
 
 ---
 
@@ -639,11 +657,20 @@ Full startup check:
 PI_OFFLINE=1 pi --list-models
 ```
 
-Workflow focused tests that currently pass in raw Node:
+Workflow focused tests:
 
 ```bash
-cd ~/Projects/pi-multi-agent/extensions/workflows
-node --test --experimental-strip-types sandbox.test.ts controller.test.ts meta.test.ts serialization.test.ts
+cd ~/Projects/pi-multi-agent
+npm run test:workflows
+```
+
+Opt-in live backend and C1 workflow matrices (use real credentials/model calls):
+
+```bash
+npm run test:live:backends
+RUN_LIVE_WORKFLOW_TESTS=1 npm run test:live:workflows
+# Optional Pi override, in provider/id form:
+PI_LIVE_WORKFLOW_MODEL=github-copilot/gpt-5-mini npm run test:live:workflows
 ```
 
 Some raw Node tests import Pi-injected packages (`@earendil-works/pi-coding-agent`, `@earendil-works/pi-tui`, `typebox`) and may fail outside Pi’s extension loader. Prefer Pi smoke-load for extension compatibility.
@@ -680,7 +707,16 @@ Rollback would involve moving current `extensions/{subagents,workflows,shared}` 
 
 ## 9. Current known caveats
 
-- Workflow `agent()` is still Pi-only.
+- Workflow and standalone agents share the global manager cap. Workflow calls wait
+  in FIFO admission when the cap is full; standalone spawn and settled-agent restart
+  remain fail-fast so a wide workflow can temporarily block new standalone work.
+- Explicit cancellation force-settles a still-running native entry as interrupted
+  once the backend acknowledges; a racing late completion cannot replace that result.
+- Manager-backed workflow transcripts intentionally contain bounded UI previews,
+  not the deleted runner's fuller tool payloads; rich redacted transcripts and
+  oversized explicit result preservation remain Task D (see `BUGS.md`).
+- Durable shared standalone/workflow agent artifacts and observability persistence
+  remain Task D.
 - Structured standalone results are live snapshot/tool data only; durable run
   artifacts and Hunk result summaries remain Task D.
 - Hunk blackboard is ephemeral and requires repo/diff context.
@@ -739,3 +775,16 @@ Completed on 2026-08-21:
    - workflow run-only start/phase/log/settlement events;
    - fault-isolation, identity, ordering, bounds, regression, smoke, and startup
      verification.
+
+Completed on 2026-08-22:
+
+1. Task C1 workflow-agent unification:
+   - one subagents-owned process service across separately evaluated extensions;
+   - manager-backed Pi/Claude/Codex workflow agents with shared model, effort,
+     schema, trust, Hunk, cancellation, and concurrency behavior;
+   - atomic bounded settlement collection under manager pruning pressure;
+   - manager snapshot projection into workflow UI and artifacts;
+   - origin-gated delivery, role persistence, model-facing tools, and steering;
+   - complete deletion and static non-reachability proof for the old workflow
+     child execution path;
+   - hermetic full gates plus opt-in live matrix/cancellation verification.

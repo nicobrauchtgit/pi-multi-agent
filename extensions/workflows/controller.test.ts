@@ -62,7 +62,7 @@ test("RunController enforces call budget and aborts queued tasks", async () => {
     /exceeded the limit/,
   );
   controller.abort();
-  await blocker;
+  await assert.rejects(blocker, /Workflow was aborted/);
   const results = await Promise.allSettled(queued);
   assert.ok(results.every((result) => result.status === "rejected"));
   assert.equal(await controller.settle({ abort: true }), true);

@@ -4,15 +4,11 @@ Confirmed issues found during implementation and review are recorded here. Block
 
 ## Open bugs
 
-None.
+- **C1-REG-001 — Workflow transcript artifacts now contain manager UI previews, not the legacy runner's fuller tool payloads:** Manager-backed workflow transcripts intentionally project normalized `argsPreview`/`outputPreview` fields. For Pi tools this can reduce arguments to roughly 4 KiB and results to the first non-empty line, whereas the removed runner retained larger tool arguments and full result text. Restoring rich recoverable payloads safely belongs with D2 capture and D4 redacted artifacts; current `transcripts.json` must not be described as a full-fidelity transcript.
+- **C1-REG-002 — Oversized explicit workflow results degrade to a whole-result truncation stub:** Core `workflow.json` state now degrades per field and preserves run/agent identity, but an explicit script return above the 1 MiB `result.json` bound is still replaced by the serialization truncation object. D4 should store redacted result artifacts with per-field or content-aware degradation while preserving a stable artifact envelope.
 
 ## Deferred implementation work
 
-- **TASK-C-001 — Two workflow agent paths:** Workflow `agent()` still uses the Pi-only runner instead of `SubagentManager`. Task C1 must move workflow-owned agents to the manager and fully remove the legacy execution path before observability database work begins; downstream support for two event vocabularies is explicitly out of scope.
-- **TASK-C-002 — Workflow result retrieval versus manager pruning:** C1's wait-then-get bridge must pin or atomically consume a workflow settlement so `MAX_TRACKED` pruning cannot remove it between `waitFor()` and `get()`. Explicit workflow return values must remain retrievable under high churn.
-- **TASK-C-003 — Workflow roles must not leak into standalone persistence:** Workflow-owned agents must remain role-less, or role persistence and role-list/model-facing surfaces must be explicitly gated by origin. Workflow metadata must never create resumable standalone role records accidentally.
-- **TASK-C-004 — Workflow metadata bounds:** `workflowRunId`, phase, label, index, and future workflow-origin metadata must be validated and byte-bounded before snapshot/artifact persistence or TUI rendering; C0 validates the workflow run ID and bounds event-envelope copies only, so the remaining groundwork fields are still not a snapshot/artifact persistence contract.
-- **TASK-C-005 — Workflow sink ownership is test-only until C1:** The workflow extension's second factory parameter is not part of Pi's `ExtensionFactory` contract, so production always receives the no-op default. C1 must consume the subagents-owned process service instead of retaining this positional test seam or starting a second sink.
 - **TASK-D-001 — Durable structured-result artifacts:** Task B exposes validated structured results through live snapshots and tool/result delivery. Persisting redacted results in the shared run artifact store and linking role records to the latest artifact remains part of Task D4.
 - **OBS-D-001 — Existing workflow artifacts are not secret-redacted:** `extensions/workflows/artifacts.ts` bounds transcripts/results, and `serialization.ts` writes them atomically, but neither applies secret redaction. Observability reconciliation must re-redact imports, and new shared artifacts must use the common scrubber; it must not create another unredacted copy.
 - **OBS-D-002 — Child path isolation is not yet sufficient for observability state:** `CHILD_EXCLUDED_TOOL_NAMES` removes orchestration tools, while normal file and shell tools remain available. Before rich capture is enabled, every backend needs an enforced protected-path boundary for daemon tokens, DB/WAL/SHM, spool, config, existing workflow artifacts, and new artifacts, plus `0700`/`0600` ownership/mode verification.
@@ -24,6 +20,18 @@ None.
 ## Planning/tooling lessons
 
 - **TOOLING-001 — Large inline workflow handoffs can exceed the agent-request limit:** Workflow `wf_275662319c63` completed seven inventory/architecture/review agents, then failed in the Document phase with `Workflow sandbox sent an invalid agent request` after the script concatenated the full architecture output and all review data into one author prompt. For large research workflows, persist each handoff as a bounded artifact and pass paths plus a compact index/decision summary to the author; do not inline every long response into the next request.
+
+## Resolved during Task C1
+
+- **TASK-C-001 — Two workflow agent paths:** Resolved by routing DSL `agent()` exclusively through `SubagentManager.runWorkflowAgent()` for Pi, Claude, and Codex, deleting `workflows/runner.ts` and its tests, and adding a static non-reachability test. No fallback flag exists.
+- **TASK-C-002 — Workflow result retrieval versus manager pruning:** Resolved with a fused manager reservation/spawn/collect operation. The durable reservation creates a collection pin before backend work, then returns a frozen bounded settlement copy before releasing the pin; high-fanout tests exceed `MAX_TRACKED` without losing results.
+- **TASK-C-003 — Workflow roles must not leak into standalone persistence:** Resolved by rejecting role, role-lease, resume, and send operations for workflow origin and origin-gating settlement/metadata persistence plus the pure role-upsert adapter. Model-facing standalone tools continue to filter non-model origins.
+- **TASK-C-004 — Workflow metadata bounds:** Resolved by exact run-ID/index validation and UTF-8 byte bounds for phase/label in the manager reservation, with defensive artifact/dashboard normalization tests.
+- **TASK-C-005 — Workflow sink ownership is test-only until C1:** Resolved by removing the second workflow factory argument and consuming the subagents-owned versioned process service/sink. Duplicate-module, load-order, child-load, epoch, replacement, and shutdown behavior is tested.
+- **TASK-C-006 — Child orchestration filter was reset during resource reload:** Resolved by filtering the scoped SettingsManager getters used by PackageManager, running resource factories inside the child AsyncLocalStorage scope, and filtering the final loaded extension set. An end-to-end resource-load test uses the real subagents/workflows paths and verifies they and their tools are absent.
+- **TASK-C-007 — Per-agent structured mirrors could replace workflow.json with a truncation stub:** Resolved by keeping structured values in the explicit `agent()` return only, explicitly bounding workflow summary fields, and refusing wholesale summary replacement. A 20-agent × 60 KiB regression fixture preserves run identity, status, and every agent record.
+
+Evidence: static removal guards, hermetic service/manager/bridge/cancellation/artifact/dashboard suites, full repository gates, an opt-in live structured Pi/Claude/Codex workflow matrix, and a live cancellation/artifact test all pass. No Task D daemon, SQLite, network/spool, redaction, web, or diff work was included.
 
 ## Resolved during Task B
 

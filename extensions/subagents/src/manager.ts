@@ -46,7 +46,6 @@ import {
   SpawnError,
 } from "./domain.ts";
 import {
-  isWorkflowRunId,
   mintAgentId,
   mintEphemeralParentIdentity,
   mintStandaloneRunId,
@@ -65,15 +64,23 @@ import {
   spawnFailureEvents,
   subagentEvent,
 } from "./observability.ts";
+import {
+  JSON_SCHEMA_MAX_BYTES,
+  STRUCTURED_OUTPUT_MAX_BYTES,
+} from "../../shared/json-schema.ts";
+import { truncateUtf8 } from "../../shared/text.ts";
+import { boundWorkflowOwnership } from "../../shared/workflow-metadata.ts";
 
 export const MAX_RUNNING = 4;
 export const MAX_TRACKED = 64;
+export const MAX_ADMISSION_WAITERS = 64;
 const STOP_TIMEOUT_MS = 5_000;
 const ERROR_TEXT_MAX_LENGTH = 4_096;
 const TRANSCRIPT_TEXT_MAX_LENGTH = 64 * 1_024;
 const LIVE_ASSISTANT_MAX_LENGTH = 128 * 1_024;
 const FINAL_TEXT_MAX_LENGTH = 1_024 * 1_024;
 const MAX_TRANSCRIPT_ITEMS = 512;
+const WORKFLOW_OUTPUT_MAX_BYTES = 64 * 1_024;
 
 function bounded(text: string) {
   return text.slice(0, ERROR_TEXT_MAX_LENGTH);
@@ -98,6 +105,114 @@ function appendTranscript(snapshot: MutableSnapshot, item: TranscriptItem) {
       snapshot.transcript.length - MAX_TRANSCRIPT_ITEMS,
     );
   }
+}
+
+function deepFreeze<T>(value: T): T {
+  if (!value || typeof value !== "object" || Object.isFrozen(value)) {
+    return value;
+  }
+  Object.freeze(value);
+  for (const nested of Object.values(value as Record<string, unknown>)) {
+    deepFreeze(nested);
+  }
+  return value;
+}
+
+function boundedJsonCopy(value: unknown, maxBytes: number, label: string) {
+  if (value === undefined) return { value: undefined };
+  try {
+    const json = JSON.stringify(value);
+    if (json === undefined) {
+      return { error: `${label} was not JSON serializable.` };
+    }
+    if (Buffer.byteLength(json, "utf8") > maxBytes) {
+      return {
+        error: `${label} exceeded the ${maxBytes} byte workflow collection limit.`,
+      };
+    }
+    return { value: JSON.parse(json) as unknown };
+  } catch {
+    return { error: `${label} was not JSON serializable.` };
+  }
+}
+
+function collectedSettlement(entry: Entry): CollectedWorkflowSettlement {
+  const source = entry.snapshot;
+  const structuredCopy = boundedJsonCopy(
+    source.structured,
+    STRUCTURED_OUTPUT_MAX_BYTES,
+    "Structured result",
+  );
+  const schemaCopy = boundedJsonCopy(
+    source.schema,
+    JSON_SCHEMA_MAX_BYTES,
+    "Structured output schema",
+  );
+  const transcript = source.transcript.map((item): TranscriptItem => {
+    if (item.kind === "user") return { ...item };
+    if (item.kind === "toolResult") return { ...item };
+    return {
+      ...item,
+      parts: item.parts.map((part) => ({ ...part })),
+    };
+  });
+  const snapshot = deepFreeze({
+    ...source,
+    identity: { ...source.identity },
+    schema: schemaCopy.value,
+    structured: structuredCopy.value,
+    meta: { ...source.meta },
+    usage: { ...source.usage },
+    transcript,
+    liveAssistant: source.liveAssistant
+      ? { ...source.liveAssistant }
+      : undefined,
+    liveTools: source.liveTools.map((tool) => ({ ...tool })),
+    queued: source.queued.map((queued) => ({ ...queued })),
+    finalText: truncateUtf8(source.finalText, WORKFLOW_OUTPUT_MAX_BYTES),
+  } satisfies SubagentSnapshot);
+  const sourceOutcome = entry.lastOutcome ?? {
+    _tag: "Failed" as const,
+    errorText: source.errorText ?? "Agent settlement was unavailable",
+    partialText: snapshot.finalText || undefined,
+  };
+  let outcome: RunOutcome;
+  if (sourceOutcome._tag === "Completed") {
+    outcome = {
+      _tag: "Completed",
+      finalText: snapshot.finalText,
+      ...(structuredCopy.value === undefined
+        ? {}
+        : { structured: structuredCopy.value }),
+    };
+  } else if (sourceOutcome._tag === "Interrupted") {
+    outcome = {
+      _tag: "Interrupted",
+      ...(snapshot.finalText ? { partialText: snapshot.finalText } : {}),
+      ...(sourceOutcome.errorText
+        ? { errorText: bounded(sourceOutcome.errorText) }
+        : {}),
+    };
+  } else {
+    outcome = {
+      _tag: "Failed",
+      errorText: bounded(sourceOutcome.errorText),
+      ...(snapshot.finalText ? { partialText: snapshot.finalText } : {}),
+      ...(sourceOutcome.schemaError
+        ? { schemaError: bounded(sourceOutcome.schemaError) }
+        : {}),
+    };
+  }
+  const collectionErrors = [structuredCopy.error, schemaCopy.error].filter(
+    (error): error is string => error !== undefined,
+  );
+  return deepFreeze({
+    snapshot,
+    outcome,
+    ...(collectionErrors.length > 0
+      ? { collectionError: collectionErrors.join(" ") }
+      : {}),
+  });
 }
 
 // --- Internal state -----------------------------------------------------------
@@ -125,7 +240,15 @@ interface MutableSnapshot {
   structured?: unknown;
   schemaError?: string;
   meta: SubagentMeta;
-  usage: { tokens?: number; contextWindow?: number };
+  usage: {
+    tokens?: number;
+    contextWindow?: number;
+    inputTokens?: number;
+    outputTokens?: number;
+    cacheReadTokens?: number;
+    cacheWriteTokens?: number;
+    costUsd?: number;
+  };
   transcript: TranscriptItem[];
   liveAssistant?: { text: string; thinking: string };
   liveTools: LiveToolState[];
@@ -141,6 +264,8 @@ interface Entry {
   roleLease?: RoleLeaseHandle;
   pump?: Fiber.Fiber<void>;
   liveToolMap: Map<string, LiveToolState>;
+  toolStartedAt: Map<string, number>;
+  lastOutcome?: RunOutcome;
   /** Idle restart dispatched but RunStarted not folded yet; counts as running
    * so concurrent restarts cannot race past the cap. */
   restarting?: boolean;
@@ -194,12 +319,39 @@ export interface ResumeRoleResult {
   readonly reopened: boolean;
 }
 
+export interface WorkflowAgentHooks {
+  readonly signal?: AbortSignal;
+  readonly onAdmissionWait?: () => void;
+  readonly onSpawned?: (snapshot: SubagentSnapshot) => void;
+}
+
+/** Immutable bounded copy captured while the manager still pins the entry. */
+export interface CollectedWorkflowSettlement {
+  readonly snapshot: SubagentSnapshot;
+  readonly outcome: RunOutcome;
+  readonly collectionError?: string;
+}
+
 export interface SubagentManagerShape {
   spawn(
     backend: BackendName,
     task: SpawnTask,
   ): Effect.Effect<
     SubagentSnapshot,
+    SpawnError | ConcurrencyLimitError | BackendUnavailableError
+  >;
+  /**
+   * Workflow-only fused reservation/spawn/collect. Its pruning pin is created
+   * with the durable reservation and released only after the frozen result
+   * copy exists. Cancellation is handled as manager work, never by
+   * interrupting this collection effect.
+   */
+  runWorkflowAgent(
+    backend: BackendName,
+    task: SpawnTask,
+    hooks?: WorkflowAgentHooks,
+  ): Effect.Effect<
+    CollectedWorkflowSettlement,
     SpawnError | ConcurrencyLimitError | BackendUnavailableError
   >;
   /** Route a role already tracked in this manager, otherwise reopen it. */
@@ -247,6 +399,7 @@ const makeManager = Effect.gen(function* () {
 
   const entries = new Map<string, Entry>();
   const waitInterest = new Map<string, number>();
+  const collectionPins = new Set<string>();
   const listeners = new Set<() => void>();
   /** One-shot nextChange waiters, swapped out before invocation so waiters
    * re-registering during notification are not visited in the same sweep. */
@@ -256,7 +409,20 @@ const makeManager = Effect.gen(function* () {
   let modelCounter = 0;
   let btwCounter = 0;
   let reserved = 0;
+  let workflowAdmissionReservations = 0;
   let disposed = false;
+
+  interface AdmissionToken {
+    active: boolean;
+  }
+  interface AdmissionWaiter {
+    readonly token: AdmissionToken;
+    readonly resolve: (token: AdmissionToken) => void;
+    readonly reject: (error: Error) => void;
+    readonly signal?: AbortSignal;
+    onAbort?: () => void;
+  }
+  const admissionWaiters: AdmissionWaiter[] = [];
   let onSettled:
     ((snap: SubagentSnapshot, consumed: boolean) => void) | undefined;
 
@@ -312,6 +478,99 @@ const makeManager = Effect.gen(function* () {
       (e) => e.snapshot.status === "running" || e.restarting === true,
     ).length;
 
+  const hasAdmissionCapacity = () =>
+    runningCount() + reserved + workflowAdmissionReservations < MAX_RUNNING;
+
+  const detachAdmissionWaiter = (waiter: AdmissionWaiter) => {
+    if (waiter.onAbort) {
+      waiter.signal?.removeEventListener("abort", waiter.onAbort);
+    }
+  };
+
+  const drainAdmissionWaiters = () => {
+    while (!disposed && admissionWaiters.length > 0 && hasAdmissionCapacity()) {
+      const waiter = admissionWaiters.shift()!;
+      detachAdmissionWaiter(waiter);
+      if (waiter.signal?.aborted) {
+        waiter.reject(new Error("Agent was aborted before admission."));
+        continue;
+      }
+      workflowAdmissionReservations++;
+      waiter.resolve(waiter.token);
+    }
+  };
+
+  const releaseAdmission = (token: AdmissionToken | undefined) => {
+    if (!token?.active) return;
+    token.active = false;
+    workflowAdmissionReservations = Math.max(
+      0,
+      workflowAdmissionReservations - 1,
+    );
+    drainAdmissionWaiters();
+    notify();
+  };
+
+  const acquireWorkflowAdmission = (hooks: WorkflowAgentHooks) =>
+    Effect.tryPromise({
+      try: () => {
+        if (disposed) {
+          return Promise.reject(
+            new Error("Subagent manager is shutting down."),
+          );
+        }
+        if (hooks.signal?.aborted) {
+          return Promise.reject(
+            new Error("Agent was aborted before admission."),
+          );
+        }
+        const token: AdmissionToken = { active: true };
+        if (admissionWaiters.length === 0 && hasAdmissionCapacity()) {
+          workflowAdmissionReservations++;
+          return Promise.resolve(token);
+        }
+        if (admissionWaiters.length >= MAX_ADMISSION_WAITERS) {
+          return Promise.reject(
+            new Error(
+              `Workflow admission queue is full (max ${MAX_ADMISSION_WAITERS} waiting calls).`,
+            ),
+          );
+        }
+        try {
+          hooks.onAdmissionWait?.();
+        } catch {
+          // Progress hooks never affect admission.
+        }
+        return new Promise<AdmissionToken>((resolve, reject) => {
+          const waiter: AdmissionWaiter = {
+            token,
+            resolve,
+            reject,
+            signal: hooks.signal,
+          };
+          if (hooks.signal) {
+            waiter.onAbort = () => {
+              const index = admissionWaiters.indexOf(waiter);
+              if (index >= 0) admissionWaiters.splice(index, 1);
+              detachAdmissionWaiter(waiter);
+              token.active = false;
+              reject(new Error("Agent was aborted before admission."));
+            };
+            hooks.signal.addEventListener("abort", waiter.onAbort, {
+              once: true,
+            });
+          }
+          admissionWaiters.push(waiter);
+        });
+      },
+      catch: (error) =>
+        error instanceof Error && /queue is full/.test(error.message)
+          ? new ConcurrencyLimitError({ message: error.message })
+          : new SpawnError({
+              message: error instanceof Error ? error.message : String(error),
+            }),
+    });
+
   const addInterest = (ids: ReadonlyArray<string>) => {
     for (const id of ids) waitInterest.set(id, (waitInterest.get(id) ?? 0) + 1);
   };
@@ -339,7 +598,9 @@ const makeManager = Effect.gen(function* () {
     const candidates = [...entries.values()]
       .filter(
         (e) =>
-          e.snapshot.status !== "running" && !waitInterest.has(e.snapshot.id),
+          e.snapshot.status !== "running" &&
+          !waitInterest.has(e.snapshot.id) &&
+          !collectionPins.has(e.snapshot.identity.agentId),
       )
       .sort(
         (a, b) =>
@@ -393,10 +654,14 @@ const makeManager = Effect.gen(function* () {
         break;
     }
     s.liveAssistant = undefined;
+    entry.lastOutcome = outcome;
     entry.liveToolMap.clear();
+    entry.toolStartedAt.clear();
     s.liveTools = [];
     s.queued = [];
-    const consumed = (waitInterest.get(s.id) ?? 0) > 0;
+    const consumed =
+      (waitInterest.get(s.id) ?? 0) > 0 ||
+      collectionPins.has(s.identity.agentId);
     notify(s.id);
     try {
       // During teardown, don't queue results into a shutting-down session.
@@ -413,6 +678,7 @@ const makeManager = Effect.gen(function* () {
       ),
     );
     entry.turnPromotedBeforeRunStart = false;
+    drainAdmissionWaiters();
     pruneSettled();
   };
 
@@ -460,6 +726,7 @@ const makeManager = Effect.gen(function* () {
         appendTranscript(s, {
           kind: "user",
           text: boundedTranscriptText(event.text),
+          timestamp: Date.now(),
         });
         break;
       case "AssistantDelta": {
@@ -483,6 +750,7 @@ const makeManager = Effect.gen(function* () {
       case "AssistantMessage":
         appendTranscript(s, {
           kind: "assistant",
+          timestamp: Date.now(),
           parts: event.parts.map((part) =>
             part.type === "toolCall"
               ? {
@@ -498,6 +766,7 @@ const makeManager = Effect.gen(function* () {
         s.turns++;
         break;
       case "ToolStart":
+        entry.toolStartedAt.set(event.toolId, Date.now());
         entry.liveToolMap.set(event.toolId, {
           toolId: event.toolId,
           name: event.name,
@@ -520,7 +789,10 @@ const makeManager = Effect.gen(function* () {
         }
         break;
       }
-      case "ToolEnd":
+      case "ToolEnd": {
+        const finishedAt = Date.now();
+        const startedAt = entry.toolStartedAt.get(event.toolId);
+        entry.toolStartedAt.delete(event.toolId);
         entry.liveToolMap.delete(event.toolId);
         s.liveTools = [...entry.liveToolMap.values()];
         appendTranscript(s, {
@@ -531,8 +803,17 @@ const makeManager = Effect.gen(function* () {
           outputPreview: event.outputPreview
             ? boundedTranscriptText(event.outputPreview)
             : undefined,
+          timestamp: finishedAt,
+          ...(startedAt === undefined
+            ? {}
+            : {
+                startedAt,
+                finishedAt,
+                durationMs: Math.max(0, finishedAt - startedAt),
+              }),
         });
         break;
+      }
       case "QueueChanged":
         s.queued = event.queued;
         break;
@@ -540,6 +821,11 @@ const makeManager = Effect.gen(function* () {
         s.usage = {
           tokens: event.tokens ?? s.usage.tokens,
           contextWindow: event.contextWindow ?? s.usage.contextWindow,
+          inputTokens: event.inputTokens ?? s.usage.inputTokens,
+          outputTokens: event.outputTokens ?? s.usage.outputTokens,
+          cacheReadTokens: event.cacheReadTokens ?? s.usage.cacheReadTokens,
+          cacheWriteTokens: event.cacheWriteTokens ?? s.usage.cacheWriteTokens,
+          costUsd: event.costUsd ?? s.usage.costUsd,
         };
         break;
       case "MetaChanged":
@@ -552,10 +838,20 @@ const makeManager = Effect.gen(function* () {
     notify(s.id);
   };
 
-  const spawn = (backendName: BackendName, task: SpawnTask) =>
+  const spawnInternal = (
+    backendName: BackendName,
+    task: SpawnTask,
+    options: {
+      admission?: AdmissionToken;
+      collect?: boolean;
+      signal?: AbortSignal;
+      onSpawned?: (snapshot: SubagentSnapshot) => void;
+    } = {},
+  ) =>
     Effect.gen(function* () {
       let reservedAt = 0;
       let reservedTask!: SpawnTask & { readonly identity: SubagentIdentity };
+      let pinnedAgentId: string | undefined;
       // Reserve and mint synchronously before availability probing or backend
       // spawn, so parallel calls cannot race either the cap or durable IDs.
       yield* Effect.suspend(
@@ -571,37 +867,101 @@ const makeManager = Effect.gen(function* () {
               }),
             );
           }
-          if (runningCount() + reserved >= MAX_RUNNING) {
+          if (options.signal?.aborted) {
+            return rejectBeforeReservation(
+              new SpawnError({ message: "Agent was aborted before spawn." }),
+            );
+          }
+
+          const origin = task.origin ?? "model";
+          let normalizedTask: SpawnTask = task;
+          if (origin === "workflow") {
+            if (task.role || task.roleLease || task.resume) {
+              return rejectBeforeReservation(
+                new SpawnError({
+                  message:
+                    "Workflow-origin subagents cannot use roles, role leases, or resume locators.",
+                }),
+              );
+            }
+            let ownership;
+            try {
+              ownership = boundWorkflowOwnership({
+                workflowRunId: task.workflowRunId,
+                workflowAgentIndex: task.workflowAgentIndex,
+                workflowPhase: task.workflowPhase,
+                workflowLabel: task.workflowLabel,
+              });
+            } catch (error) {
+              return rejectBeforeReservation(
+                new SpawnError({
+                  message:
+                    error instanceof Error ? error.message : String(error),
+                }),
+              );
+            }
+            normalizedTask = {
+              ...task,
+              ...ownership,
+              origin: "workflow",
+              autoDeliver: false,
+            };
+          } else if (
+            task.workflowRunId !== undefined ||
+            task.workflowAgentIndex !== undefined ||
+            task.workflowPhase !== undefined ||
+            task.workflowLabel !== undefined
+          ) {
+            return rejectBeforeReservation(
+              new SpawnError({
+                message:
+                  "Workflow ownership metadata is allowed only for workflow-origin subagents.",
+              }),
+            );
+          }
+
+          if (options.admission) {
+            if (!options.admission.active) {
+              return rejectBeforeReservation(
+                new SpawnError({ message: "Workflow admission expired." }),
+              );
+            }
+            options.admission.active = false;
+            workflowAdmissionReservations = Math.max(
+              0,
+              workflowAdmissionReservations - 1,
+            );
+          } else if (
+            runningCount() + reserved + workflowAdmissionReservations >=
+            MAX_RUNNING
+          ) {
             return rejectBeforeReservation(
               new ConcurrencyLimitError({
                 message: `Max ${MAX_RUNNING} subagents can run concurrently. Wait for one to finish before spawning another.`,
               }),
             );
           }
-          const origin = task.origin ?? "model";
-          if (origin === "workflow" && !isWorkflowRunId(task.workflowRunId)) {
-            return rejectBeforeReservation(
-              new SpawnError({
-                message:
-                  'Workflow-origin subagents require a valid workflowRunId ("wf_" plus 12 lowercase hex characters).',
-              }),
-            );
-          }
+
           const fallbackParent = mintEphemeralParentIdentity();
           const identity: SubagentIdentity = Object.freeze({
             runId:
               origin === "workflow"
-                ? task.workflowRunId!
+                ? normalizedTask.workflowRunId!
                 : mintStandaloneRunId(),
             agentId: mintAgentId(),
             turnId: mintTurnId(),
             origin,
-            parentRunId: task.parent.rootRunId ?? fallbackParent.rootRunId,
-            traceId: task.parent.traceId ?? fallbackParent.traceId,
+            parentRunId:
+              normalizedTask.parent.rootRunId ?? fallbackParent.rootRunId,
+            traceId: normalizedTask.parent.traceId ?? fallbackParent.traceId,
           });
-          reservedTask = Object.freeze({ ...task, identity });
+          reservedTask = Object.freeze({ ...normalizedTask, identity });
           reservedAt = Date.now();
           reserved++;
+          if (options.collect) {
+            pinnedAgentId = identity.agentId;
+            collectionPins.add(identity.agentId);
+          }
           observe(() =>
             agentCreatedEvent(backendName, reservedTask, reservedAt),
           );
@@ -610,6 +970,11 @@ const makeManager = Effect.gen(function* () {
       );
 
       const doSpawn = Effect.gen(function* () {
+        if (options.signal?.aborted) {
+          return yield* new SpawnError({
+            message: "Agent was aborted before backend spawn.",
+          });
+        }
         const backend: SubagentBackend | undefined = registry.get(backendName);
         if (!backend) {
           return yield* new BackendUnavailableError({
@@ -628,10 +993,12 @@ const makeManager = Effect.gen(function* () {
           backend.spawn(reservedTask),
           scope,
         ).pipe(Effect.onError(() => Scope.close(scope, Exit.void)));
-        if (disposed) {
+        if (disposed || options.signal?.aborted) {
           yield* Scope.close(scope, Exit.void);
           return yield* new SpawnError({
-            message: "Subagent manager shut down while spawning.",
+            message: disposed
+              ? "Subagent manager shut down while spawning."
+              : "Agent was aborted while spawning.",
           });
         }
 
@@ -673,9 +1040,15 @@ const makeManager = Effect.gen(function* () {
           scope,
           roleLease: reservedTask.roleLease,
           liveToolMap: new Map(),
+          toolStartedAt: new Map(),
           runCount: 0,
         };
         entries.set(id, entry);
+        try {
+          options.onSpawned?.(entry.snapshot);
+        } catch {
+          // Workflow progress hooks are outside lifecycle ownership.
+        }
 
         // Pump: fold the event stream into the snapshot. Tied to the entry
         // scope, so closing the scope stops it. If the stream ends while the
@@ -715,16 +1088,21 @@ const makeManager = Effect.gen(function* () {
               }),
             );
             reservedTask.roleLease?.release();
+            if (pinnedAgentId) collectionPins.delete(pinnedAgentId);
           }),
         ),
         Effect.ensuring(
           Effect.sync(() => {
             reserved--;
+            drainAdmissionWaiters();
             notify();
           }),
         ),
       );
     });
+
+  const spawn = (backendName: BackendName, task: SpawnTask) =>
+    spawnInternal(backendName, task);
 
   const resumeRole = (backendName: BackendName, task: SpawnTask) =>
     Effect.suspend(
@@ -818,6 +1196,15 @@ const makeManager = Effect.gen(function* () {
           Effect.timeout(STOP_TIMEOUT_MS),
           Effect.ignore,
         );
+      } else if (entry.snapshot.status === "running") {
+        // A backend may acknowledge interruption before its terminal event is
+        // folded. Settle deterministically; a later duplicate is ignored.
+        yield* Effect.sync(() =>
+          settle(entry, {
+            _tag: "Interrupted",
+            errorText: "Run was aborted",
+          }),
+        );
       }
     });
 
@@ -862,6 +1249,70 @@ const makeManager = Effect.gen(function* () {
       );
     });
 
+  const runWorkflowAgent = (
+    backendName: BackendName,
+    task: SpawnTask,
+    hooks: WorkflowAgentHooks = {},
+  ) =>
+    Effect.gen(function* () {
+      const admission = yield* acquireWorkflowAdmission(hooks);
+      const started = yield* spawnInternal(
+        backendName,
+        { ...task, origin: "workflow", autoDeliver: false },
+        {
+          admission,
+          collect: true,
+          signal: hooks.signal,
+          onSpawned: hooks.onSpawned,
+        },
+      ).pipe(
+        Effect.ensuring(
+          Effect.sync(() => {
+            releaseAdmission(admission);
+          }),
+        ),
+      );
+
+      const entry = entries.get(started.id);
+      if (!entry) {
+        collectionPins.delete(started.identity.agentId);
+        return yield* new SpawnError({
+          message: "Workflow agent entry disappeared before collection.",
+        });
+      }
+
+      let cancellationRequested = false;
+      const requestCancellation = () => {
+        if (cancellationRequested) return;
+        cancellationRequested = true;
+        runDetached(cancel([started.id]).pipe(Effect.ignore));
+      };
+      hooks.signal?.addEventListener("abort", requestCancellation, {
+        once: true,
+      });
+      if (hooks.signal?.aborted) requestCancellation();
+
+      const collect = Effect.gen(function* () {
+        while (
+          entry.snapshot.status === "running" ||
+          entry.restarting === true
+        ) {
+          yield* nextChange;
+        }
+        return collectedSettlement(entry);
+      });
+      return yield* collect.pipe(
+        Effect.ensuring(
+          Effect.sync(() => {
+            hooks.signal?.removeEventListener("abort", requestCancellation);
+            collectionPins.delete(entry.snapshot.identity.agentId);
+            pruneSettled();
+            notify(entry.snapshot.id);
+          }),
+        ),
+      );
+    });
+
   const send = (id: string, text: string) =>
     Effect.suspend((): Effect.Effect<void, SendError> => {
       const entry = entries.get(id);
@@ -870,11 +1321,20 @@ const makeManager = Effect.gen(function* () {
           message: `Subagent "${id}" is no longer tracked.`,
         });
       }
+      if (entry.snapshot.origin === "workflow") {
+        return new SendError({
+          message:
+            "Workflow-origin subagents cannot be steered or restarted outside their script agent() call.",
+        });
+      }
       // Restarting a settled subagent occupies a running slot again, so it
       // must respect the same cap as spawn. Steering an already-running one
       // does not consume additional capacity.
       if (entry.snapshot.status !== "running") {
-        if (runningCount() + reserved >= MAX_RUNNING) {
+        if (
+          runningCount() + reserved + workflowAdmissionReservations >=
+          MAX_RUNNING
+        ) {
           return new SendError({
             message: `Max ${MAX_RUNNING} subagents can run concurrently; restarting "${id}" would exceed that.`,
           });
@@ -901,9 +1361,22 @@ const makeManager = Effect.gen(function* () {
     });
 
   const disposeAll = Effect.gen(function* () {
+    if (disposed && entries.size === 0) return;
     disposed = true;
+    const queuedAdmissions = admissionWaiters.splice(0);
+    for (const waiter of queuedAdmissions) {
+      detachAdmissionWaiter(waiter);
+      waiter.token.active = false;
+      waiter.reject(new Error("Subagent manager is shutting down."));
+    }
+    workflowAdmissionReservations = 0;
     const all = [...entries.values()];
-    entries.clear();
+    yield* Effect.forEach(all, abortEntry, { concurrency: "unbounded" });
+    // Give fused workflow collectors a bounded window to copy their settled
+    // entries before runtime disposal can interrupt consumer fibers.
+    yield* Effect.gen(function* () {
+      while (collectionPins.size > 0) yield* nextChange;
+    }).pipe(Effect.timeout(STOP_TIMEOUT_MS), Effect.ignore);
     yield* Effect.forEach(
       all,
       (entry) =>
@@ -913,6 +1386,7 @@ const makeManager = Effect.gen(function* () {
         ),
       { concurrency: "unbounded" },
     );
+    entries.clear();
     // Pruning cleanups are detached; bound them like everything else so a
     // stuck backend finalizer cannot block runtime shutdown indefinitely.
     yield* Effect.forEach(
@@ -921,7 +1395,10 @@ const makeManager = Effect.gen(function* () {
         Fiber.await(fiber).pipe(Effect.timeout(STOP_TIMEOUT_MS), Effect.ignore),
       { concurrency: "unbounded" },
     ).pipe(Effect.ignore);
-    yield* Effect.sync(() => notify());
+    yield* Effect.sync(() => {
+      collectionPins.clear();
+      notify();
+    });
   });
 
   const view: SubagentReadModel = {
@@ -965,6 +1442,7 @@ const makeManager = Effect.gen(function* () {
 
   return SubagentManager.of({
     spawn,
+    runWorkflowAgent,
     resumeRole,
     waitFor,
     cancel,

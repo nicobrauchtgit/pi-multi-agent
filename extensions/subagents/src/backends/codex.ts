@@ -250,9 +250,13 @@ export function codexOutputSchemaSupportError(
 export function parseThreadTokenUsage(params: unknown) {
   const usage = record(record(params)?.tokenUsage);
   const last = record(usage?.last);
+  const total = record(usage?.total);
   return {
     tokens: numberValue(last?.totalTokens),
     contextWindow: numberValue(usage?.modelContextWindow),
+    inputTokens: numberValue(total?.inputTokens),
+    outputTokens: numberValue(total?.outputTokens),
+    cacheReadTokens: numberValue(total?.cachedInputTokens),
   };
 }
 
@@ -757,12 +761,25 @@ const makeCodexSession = (
           break;
         }
         case "thread/tokenUsage/updated": {
-          const { tokens, contextWindow } = parseThreadTokenUsage(params);
+          const {
+            tokens,
+            contextWindow,
+            inputTokens,
+            outputTokens,
+            cacheReadTokens,
+          } = parseThreadTokenUsage(params);
           if (contextWindow !== undefined) {
             state.meta = { ...state.meta, contextWindow };
             emit({ _tag: "MetaChanged", meta: { contextWindow } });
           }
-          emit({ _tag: "UsageChanged", tokens, contextWindow });
+          emit({
+            _tag: "UsageChanged",
+            tokens,
+            contextWindow,
+            inputTokens,
+            outputTokens,
+            cacheReadTokens,
+          });
           break;
         }
         case "error": {

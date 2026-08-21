@@ -45,8 +45,15 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Markdown, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
+import { isChildExtensionLoad } from "../shared/child-session.ts";
 import { ensureBlackboard, withBlackboard } from "../shared/hunk-blackboard.ts";
 import { parentIdentityFromPiSession } from "../shared/observability/ids.ts";
+import { NOOP_OBSERVABILITY_SINK } from "../shared/observability/sink.ts";
+import {
+  disposeProcessService,
+  provideProcessService,
+  type ProcessServiceHandle,
+} from "../shared/service-registry.ts";
 import { deriveBtwTitle, isModelVisible } from "./src/by-the-way.ts";
 import {
   BACKEND_NAMES,
@@ -214,21 +221,42 @@ function resolveChildProjectTrust(options: {
 }
 
 export default function (pi: ExtensionAPI) {
+  if (isChildExtensionLoad()) return;
+
   let runtime: SubagentRuntime | undefined;
   let managerPromise: Promise<SubagentManagerShape> | undefined;
+  let serviceHandle:
+    ProcessServiceHandle<SubagentRuntime, SubagentManagerShape> | undefined;
   let sessionContext: ExtensionContext | undefined;
+  let serviceSessionId: string | undefined;
+  let sessionActive = false;
+  let serviceInitializationError: string | undefined;
   let ui: ExtensionUIContext | undefined;
   let unsubStatus: (() => void) | undefined;
   const resultDelivery = createDeferredResultDelivery<SubagentSnapshot>();
   const roleMetaFingerprints = new Map<string, string>();
 
-  const getRuntime = () => (runtime ??= createSubagentRuntime());
-
-  /** Resolve the manager service once per runtime and wire the extension hooks. */
-  const getManager = () => {
-    managerPromise ??= getRuntime()
+  const initializeService = () => {
+    if (!sessionActive || !sessionContext) {
+      throw new Error("The subagent session is not active.");
+    }
+    if (serviceInitializationError) {
+      throw new Error(serviceInitializationError);
+    }
+    if (runtime && managerPromise && serviceHandle?.isCurrent()) return;
+    const createdRuntime = createSubagentRuntime(NOOP_OBSERVABILITY_SINK);
+    const createdManager = createdRuntime
       .runPromise(SubagentManager)
       .then((manager) => {
+        // closeOwnedService invalidates ownership synchronously before awaiting
+        // this promise. A late manager must not reinstall listeners afterward.
+        if (
+          runtime !== createdRuntime ||
+          managerPromise !== createdManager ||
+          !serviceHandle?.isCurrent()
+        ) {
+          return manager;
+        }
         manager.view.setOnSettled(onSettled);
         unsubStatus?.();
         unsubStatus = manager.view.subscribe(() => {
@@ -239,7 +267,34 @@ export default function (pi: ExtensionAPI) {
         syncRoleMetadata(manager);
         return manager;
       });
-    return managerPromise;
+    let createdHandle: ProcessServiceHandle<
+      SubagentRuntime,
+      SubagentManagerShape
+    >;
+    try {
+      createdHandle = provideProcessService({
+        runtime: createdRuntime,
+        manager: createdManager,
+        sink: NOOP_OBSERVABILITY_SINK,
+      });
+    } catch (error) {
+      void createdRuntime.dispose();
+      throw error;
+    }
+    runtime = createdRuntime;
+    managerPromise = createdManager;
+    serviceHandle = createdHandle;
+  };
+
+  const getRuntime = () => {
+    initializeService();
+    return runtime!;
+  };
+
+  /** Resolve the manager service once per runtime and wire the extension hooks. */
+  const getManager = () => {
+    initializeService();
+    return managerPromise!;
   };
 
   const updateStatus = (manager: SubagentManagerShape) => {
@@ -289,6 +344,7 @@ export default function (pi: ExtensionAPI) {
     extras: Parameters<typeof roleUpsertFromSnapshot>[1] = {},
     resetNativeLocator = false,
   ) => {
+    if (snap.origin !== "model") return;
     const upsert = roleUpsertFromSnapshot(snap, {
       parentPiSessionId: sessionContext?.sessionManager.getSessionId(),
       ...extras,
@@ -305,6 +361,7 @@ export default function (pi: ExtensionAPI) {
   const syncRoleMetadata = (manager: SubagentManagerShape) => {
     for (const snap of manager.view.list()) {
       if (
+        snap.origin !== "model" ||
         !snap.role ||
         (!snap.meta.sessionFilePath && !snap.meta.nativeSessionId)
       ) {
@@ -351,6 +408,10 @@ export default function (pi: ExtensionAPI) {
     // A shutdown can settle children while disposing their scopes. Never
     // append into a session whose extension runtime is already closing.
     if (!sessionContext) return;
+    if (snap.origin === "workflow") {
+      resultDelivery.consume([snap.id]);
+      return;
+    }
     const deliveryChannel = resultDeliveryChannel(snap);
     if (deliveryChannel === "btw") {
       deliverBtwResult({ ...snap, meta: { ...snap.meta } });
@@ -369,27 +430,70 @@ export default function (pi: ExtensionAPI) {
     if (sessionContext?.isIdle()) flushResults();
   };
 
-  pi.on("session_start", (_event, ctx) => {
+  const closeOwnedService = async (reason: string) => {
+    resultDelivery.clear();
+    roleMetaFingerprints.clear();
+    unsubStatus?.();
+    unsubStatus = undefined;
+    const closingRuntime = runtime;
+    const closingManager = managerPromise;
+    const closingHandle = serviceHandle;
+    runtime = undefined;
+    managerPromise = undefined;
+    serviceHandle = undefined;
+    serviceSessionId = undefined;
+    if (closingHandle) {
+      disposeProcessService(closingHandle.ownerToken, reason);
+    }
+    // Settle manager-owned workflow collectors before ManagedRuntime disposal
+    // can interrupt their fused collection fibers.
+    try {
+      const manager = await closingManager;
+      if (closingRuntime && manager) {
+        await closingRuntime.runPromise(manager.disposeAll);
+      }
+    } catch {
+      // Runtime disposal remains the final bounded cleanup.
+    }
+    await NOOP_OBSERVABILITY_SINK.flush(250).catch(() => {});
+    await closingRuntime?.dispose();
+  };
+
+  pi.on("session_start", async (_event, ctx) => {
+    const nextSessionId = ctx.sessionManager.getSessionId();
+    if (serviceHandle) {
+      sessionActive = false;
+      sessionContext = undefined;
+      await closeOwnedService(
+        serviceSessionId === nextSessionId
+          ? "Subagent extension was reloaded"
+          : "Parent Pi session was replaced",
+      );
+    }
     sessionContext = ctx;
+    serviceSessionId = nextSessionId;
+    sessionActive = true;
+    serviceInitializationError = undefined;
     if (ctx.hasUI) ui = ctx.ui;
+    try {
+      initializeService();
+    } catch (error) {
+      serviceInitializationError = `Subagent service initialization failed: ${
+        error instanceof Error ? error.message : String(error)
+      }`;
+      if (ctx.hasUI) ctx.ui.notify(serviceInitializationError, "error");
+    }
   });
 
   pi.on("agent_settled", flushResults);
 
   pi.on("session_shutdown", async () => {
+    sessionActive = false;
     sessionContext = undefined;
-    resultDelivery.clear();
-    roleMetaFingerprints.clear();
-    unsubStatus?.();
-    unsubStatus = undefined;
+    serviceInitializationError = undefined;
     ui?.setStatus("subagents", undefined);
     ui = undefined;
-    const closing = runtime;
-    runtime = undefined;
-    managerPromise = undefined;
-    // Disposing the runtime runs the manager finalizer, which tears down all
-    // subagent scopes (and, later, their real child processes).
-    await closing?.dispose();
+    await closeOwnedService("Subagent service was reloaded or shut down");
   });
 
   // --- Tools -------------------------------------------------------------

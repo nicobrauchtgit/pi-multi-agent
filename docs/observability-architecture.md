@@ -1,7 +1,7 @@
 # Observability architecture
 
-_Status: accepted staged plan; C0 implemented, C1 and D phases not started_
-_Last updated: 2026-08-21_
+_Status: accepted staged plan; C0 and C1 implemented, D phases not started_
+_Last updated: 2026-08-22_
 
 This document is the canonical plan for local observability in Pi Multi-Agent. It is specific enough to implement, but it deliberately avoids building the final analytics platform before the first useful slice has been dogfooded.
 
@@ -44,8 +44,8 @@ Polling is sufficient until measured UI use shows otherwise. Bounded content rem
 1. **One companion process.** One local daemon owns SQLite, ingestion, projection updates, the read API, and static UI files.
 2. **One SQLite writer.** The daemon is the only live writer and uses WAL mode. Offline purge may write only after acquiring the same daemon lock while the daemon is stopped.
 3. **Hooks and manager events are primary.** Artifacts are recovery and enrichment inputs and never override a known authoritative manager or Pi-hook fact.
-4. **One workflow-agent vocabulary.** C1 fully removes the legacy workflow child-runner path before any database phase begins.
-5. **Clear C0/C1 ownership.** C0 workflow events describe only run-level start/phase/log/settle. After C1, all workflow-owned agent lifecycle, messages, tools, usage, and settlement come only from `SubagentManager`.
+4. **One workflow-agent vocabulary.** C1 removed the legacy workflow child-runner path before any database phase began.
+5. **Clear C0/C1 ownership.** C0 workflow events describe only run-level start/phase/log/settle. All workflow-owned agent lifecycle, messages, tools, usage, and settlement now come only from `SubagentManager`.
 6. **Durable identity precedes child work.** Manager-owned `runId`, `agentId`, origin, and workflow linkage are minted before `backend.spawn()`. V1 observes child activity at the manager boundary. Exact attribution of child-extension hooks is deferred until Pi exposes a per-session, non-racy context that is available before the child's `session_start`.
 7. **No unredacted observability shadow.** The producer redacts before spooling or writing new observability artifacts. The daemon independently re-redacts all accepted payloads, including unknown event kinds. Existing native/session artifacts may predate this system; reconciliation never copies them without redaction.
 8. **Every stored byte was scanned.** Oversized requests or non-content envelopes are rejected before persistence. Oversized content fields are fully scanned, bounded/truncated, and fully scanned again; field-cap overflow alone does not discard the event.
@@ -61,11 +61,11 @@ The plan relies on current repository behavior rather than a hypothetical rewrit
 - `extensions/subagents/src/domain.ts` defines the normalized event union used by Pi, Claude, and Codex backends.
 - `SubagentManager` is already the single consumer that folds those events into live snapshots.
 - Current `sa-N` and `btw-N` identifiers remain process-local display IDs allocated after `backend.spawn()`. C0 added separate durable run/agent/turn IDs in the synchronous reservation before backend availability and spawn side effects.
-- Task C groundwork carries workflow origin/ownership metadata through manager snapshots, suppresses standalone auto-delivery for workflow-origin agents, and exposes manager wait/get delivery seams. C0 durable identity, envelope/sink contracts, manager events, and workflow run events are implemented; C1 execution unification has not started.
-- Workflow `agent()` currently bypasses the manager and uses `extensions/workflows/runner.ts`; C1 retires that execution path.
-- Workflow state is currently mutated directly in `extensions/workflows/index.ts` and persisted as bounded `workflow.json`, `result.json`, and `transcripts.json` files.
-- Current workflow artifacts are bounded and atomically written, but they do not redact content.
-- Pi child sessions load extensions and bind them during session creation. There is no proven, backend-neutral API for attaching an observability identity before child-extension `session_start`.
+- Task C1 carries validated, bounded workflow ownership metadata through manager snapshots, forces `autoDeliver: false`, atomically pins/copies workflow settlements before pruning, and projects the same snapshots into workflow UI/artifacts.
+- Workflow `agent()` uses `SubagentManager.runWorkflowAgent()` for Pi, Claude, and Codex. `extensions/workflows/runner.ts` is deleted and static tests reject any replacement fallback path.
+- Workflow state is currently mutated directly in `extensions/workflows/index.ts` and persisted as bounded `workflow.json`, `result.json`, and `transcripts.json` files. Validated per-agent structured values remain explicit `agent()` return data and are not duplicated into `workflow.json`; durable structured-result artifacts remain D4.
+- Current workflow artifacts are bounded and atomically written, but they do not redact content. Manager transcript artifacts contain UI previews rather than recoverable rich tool payloads.
+- Pi child sessions load extensions and bind them during session creation. Child resource reload and binding both run inside a global `AsyncLocalStorage` scope; exact-realpath filters wrap the scoped SettingsManager getters used by PackageManager and filter the final extension set. This prevents in-process children from loading the parent subagents/workflows entries or acquiring the parent service. There is still no proven, backend-neutral API for attaching an observability identity before child-extension `session_start`.
 - `CHILD_EXCLUDED_TOOL_NAMES` blocks orchestration tools only. File and shell tools can currently reach same-user files, so permissions alone do not protect future observability state from a child agent.
 - Concurrent children normally share the same cwd. Hunk and GitButler inspect that shared working copy; neither provides automatic per-agent authorship.
 
@@ -77,7 +77,7 @@ The plan relies on current repository behavior rather than a hypothetical rewrit
                                                            │
  Workflow run reducer (start/phase/log/settle only) ────────┤
                                                            v
- Workflow agent() ── C1 ──> SubagentManager ─────────> Producer sink
+ Workflow agent() ─────────> SubagentManager ─────────> Producer sink
                                 │                          │
                          Pi / Claude / Codex               │ redacts + bounds
                                 children                   │ batches / spools
@@ -264,9 +264,9 @@ Delivery is at least once. `eventId` is reused unchanged by every replayer.
 
 ### 9.1 Pi-side owner
 
-After C1, `extensions/subagents/index.ts` is the sole Pi-side owner of the manager, sink, and `ensureDaemon()` call. The workflow extension consumes manager/sink services but never starts or stops the daemon independently. If workflows are loaded without the subagents service, the extension may load for diagnostics, but workflow execution fails clearly rather than reviving the legacy runner.
+Since C1, `extensions/subagents/index.ts` is the sole Pi-side owner of the manager and sink and will own the future `ensureDaemon()` call. The workflow extension lazily consumes a versioned process-service handle but never creates a manager/sink or starts/stops a daemon independently. If workflows are loaded without the subagents service, the extension still loads for diagnostics, but workflow execution fails clearly rather than reviving a private runner.
 
-A process-wide shared module guard ensures repeated `session_start` hooks or `/reload` do not create multiple producers. `session_shutdown` performs a bounded sink flush and spools the remainder; it disposes child sessions as it does today but does not kill a daemon that may serve another Pi session or browser.
+The service boundary uses a `Symbol.for(...)` `globalThis` registry rather than a module singleton because Pi evaluates shared modules separately per extension with jiti module caching disabled. One live owner token and epoch guard manager/runtime/sink identity; reload, session replacement, and shutdown invalidate the handle and abort consumers before bounded manager/runtime cleanup. Child resource reload and binding run inside a global `AsyncLocalStorage` scope, while exact-realpath filters cover both PackageManager's scoped settings inputs and the final loaded extension set. The scope also denies provide/acquire defensively. Future D2 producer guarding and bounded spool flush attach to this existing owner; C1 itself still uses the no-op sink and adds no daemon or spool.
 
 ### 9.2 Companion home
 
@@ -713,6 +713,9 @@ The authenticated read API streams already-redacted JSONL. A CLI wrapper may wri
 - Finalized parent assistant/thinking content is represented by `message.assistant`; streaming deltas are not persisted.
 - Identity is minted before backend spawn and remains stable through follow-up/resume.
 - Workflow-owned agent events are emitted only by manager, never by the workflow run reducer.
+- The C1 process service is single-owner across duplicate module evaluation, invalidates epochs on reload/session replacement, and is inaccessible during child extension binding.
+- Atomic workflow collection survives more than `MAX_TRACKED` settlements, FIFO admission shares the global cap, and cancellation settles active/spawning/queued manager work.
+- Repository removal tests prove workflow production code cannot import Pi session constructors or execute a private child runner.
 - Receive-sequence replay produces identical projections after rebuild.
 - Wall-clock skew cannot freeze or overwrite a projection.
 - Artifact precedence fills missing facts but cannot overwrite primary fields.
@@ -795,29 +798,46 @@ Rollback: remove/disable the additive sink and ID plumbing. There is no persiste
 
 ### C1 — unify workflow agents and retire the legacy runner
 
-Status: not started; workflow `agent()` still executes through the legacy Pi-only runner.
+Status: completed 2026-08-22.
 
-Implement all existing Task C requirements:
+Implemented:
 
-- route workflow `agent()` through `SubagentManager`;
-- support `harness`, model, effort, and schema across Pi/Claude/Codex;
-- have the workflow bridge consume the existing `origin: "workflow"`, `workflowRunId`, workflow phase/index/label, and forced `autoDeliver: false` groundwork before spawn;
-- await manager settlement and return `{ ok, output, structured?, error? }` to the script;
-- keep per-agent status/preview/usage/transcript visible in `/workflows` and show workflow ownership in `/subagents`;
-- propagate workflow cancellation to manager cancellation;
-- suppress standalone parent follow-up/result delivery for workflow-owned agents;
-- remove the old workflow child execution path and any fallback flag/code.
+- one versioned `globalThis` process-service registry with subagents as sole
+  runtime/manager/sink provider and workflows as lazy consumer;
+- owner-token/epoch invalidation for reload, session replacement, shutdown, and
+  active workflow cancellation, plus scoped settings/final-result extension
+  filtering and an `AsyncLocalStorage` resource-load/bind guard for children;
+- `SubagentManager.runWorkflowAgent()` with FIFO workflow admission under the
+  shared global cap and an atomic pruning pin/frozen bounded settlement copy;
+- Pi/Claude/Codex DSL selection, backend model hints, Pi provider migration
+  shim, shared effort scale, and schema preflight;
+- forced workflow origin/ownership and `autoDeliver: false`, role/resume/send
+  rejection, and defensive origin gates on delivery and role persistence;
+- manager snapshot projection into workflow records for durable/display IDs,
+  harness/model, context occupancy, preview, usage/cost, normalized transcript
+  and tool timing, and state/schema errors; per-agent structured values remain
+  explicit script return data rather than duplicated checkpoint payload;
+- workflow/invocation/service/shutdown cancellation through manager-native
+  interruption, including admission wait and spawn-race cleanup;
+- workflow ownership in `/subagents`, workflow progress/artifact parity, and
+  standalone model-facing filtering;
+- deletion of `workflows/runner.ts` and its tests with no fallback; static
+  repository tests reject session constructors, execution symbols, or a second
+  extension-factory sink argument.
 
-Acceptance gate:
+Acceptance result:
 
-- all harnesses work in workflow scripts;
-- no duplicate parent follow-up;
-- cancellation and shutdown settle manager-owned children;
-- workflow explicit returns remain the source of truth;
-- tests prove only manager event kinds represent workflow agents;
-- repository search and tests prove the legacy runner cannot execute an agent.
+- hermetic duplicate-module/service lifecycle, manager high-churn/admission,
+  cancellation, metadata, bridge, sandbox, artifact, dashboard, and one-event-
+  vocabulary tests pass;
+- an opt-in live DSL matrix returned validated structured values from Pi,
+  Claude, and Codex, and a live cancelled Codex workflow settled manager state
+  and artifacts;
+- `npm test`, `npm run check`, `npm run format:check`, `npm run smoke`, and
+  `PI_OFFLINE=1 pi --list-models` pass.
 
-Rollback: revert C1 as one unit before D1. Do not retain both paths for a soak period, and do not start D work until C1 is accepted.
+Rollback remains one-unit C1 reversion only. No dual path or fallback exists.
+D1 can now start separately; C1 implemented none of D1-D5.
 
 ### D1 — minimal daemon, schema, and projections
 
@@ -986,5 +1006,5 @@ Same-UID child agents may otherwise reach the Moshi socket/state, so §11's futu
 | Shared redaction              | One dependency-free `.mjs` implementation serves Pi and bare Node (§11).                                     |
 | C0 dashboard utility          | `dashboard-state.ts` is not reused or removed by C0 (§18).                                                   |
 | Incomplete projections        | Initialize at zero in memory and persist the triggering event sequence atomically (§10).                     |
-| Task C integration risks      | Deferred C1/D implementation guards remain tracked in `BUGS.md`; C0 completion does not mark C1 complete.    |
+| Task C integration risks      | C1 is complete; only D-phase implementation guards remain tracked in `BUGS.md`.                              |
 | Moshi interoperability        | Conceptual reuse and a future secondary importer only; no private-protocol dependency (§21).                 |

@@ -170,6 +170,11 @@ export interface AgentUsagePayload {
   readonly displayId: string;
   readonly tokens?: number;
   readonly contextWindow?: number;
+  readonly inputTokens?: number;
+  readonly outputTokens?: number;
+  readonly cacheReadTokens?: number;
+  readonly cacheWriteTokens?: number;
+  readonly costUsd?: number;
 }
 
 export interface AgentMetaPayload {

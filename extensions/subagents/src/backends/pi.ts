@@ -379,11 +379,31 @@ const makePiSession = (
     };
 
     const emitUsage = () => {
-      const usage = session.getContextUsage();
+      const contextUsage = session.getContextUsage();
+      let inputTokens = 0;
+      let outputTokens = 0;
+      let cacheReadTokens = 0;
+      let cacheWriteTokens = 0;
+      let costUsd = 0;
+      for (const message of session.messages) {
+        if (messageRole(message) !== "assistant") continue;
+        const usage = (message as AssistantMessage).usage;
+        inputTokens += usage?.input ?? 0;
+        outputTokens += usage?.output ?? 0;
+        cacheReadTokens += usage?.cacheRead ?? 0;
+        cacheWriteTokens += usage?.cacheWrite ?? 0;
+        costUsd += usage?.cost?.total ?? 0;
+      }
       emit({
         _tag: "UsageChanged",
-        tokens: usage?.tokens ?? undefined,
-        contextWindow: activeModel()?.contextWindow ?? usage?.contextWindow,
+        tokens: contextUsage?.tokens ?? undefined,
+        contextWindow:
+          activeModel()?.contextWindow ?? contextUsage?.contextWindow,
+        inputTokens,
+        outputTokens,
+        cacheReadTokens,
+        cacheWriteTokens,
+        costUsd,
       });
     };
 
