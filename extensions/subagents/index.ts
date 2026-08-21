@@ -46,6 +46,7 @@ import {
 import { Markdown, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { ensureBlackboard, withBlackboard } from "../shared/hunk-blackboard.ts";
+import { parentIdentityFromPiSession } from "../shared/observability/ids.ts";
 import { deriveBtwTitle, isModelVisible } from "./src/by-the-way.ts";
 import {
   BACKEND_NAMES,
@@ -465,6 +466,7 @@ export default function (pi: ExtensionAPI) {
           reasoningEffort: params.reasoning_effort,
           parent: {
             parentCwd: ctx.cwd,
+            ...parentIdentityFromPiSession(ctx.sessionManager.getSessionId()),
             projectTrusted: resolveChildProjectTrust({
               parentCwd: ctx.cwd,
               childCwd: cwd,
@@ -981,6 +983,7 @@ export default function (pi: ExtensionAPI) {
           reasoningEffort,
           parent: {
             parentCwd: ctx.cwd,
+            ...parentIdentityFromPiSession(ctx.sessionManager.getSessionId()),
             projectTrusted: resolveChildProjectTrust({
               parentCwd: ctx.cwd,
               childCwd: cwd,
@@ -1221,6 +1224,7 @@ export default function (pi: ExtensionAPI) {
           cwd: ctx.cwd,
           parent: {
             parentCwd: ctx.cwd,
+            ...parentIdentityFromPiSession(ctx.sessionManager.getSessionId()),
             projectTrusted: ctx.isProjectTrusted(),
             inheritedModel: ctx.model
               ? { provider: ctx.model.provider, id: ctx.model.id }

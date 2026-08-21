@@ -128,7 +128,7 @@ Workflow agent()
   -> structured output, artifacts, workflow progress
 ```
 
-Task C groundwork is implemented: manager snapshots can carry workflow ownership metadata, workflow-origin settlements suppress standalone parent delivery, and manager wait/get seams can support a future bridge. This does **not** unify execution: workflow `agent()` still uses the legacy Pi-only runner, and both C0 observability contracts and C1 execution unification remain not started.
+Task C groundwork and C0 are implemented: manager snapshots carry workflow ownership metadata and durable identity, workflow-origin settlements suppress standalone parent delivery, manager wait/get seams support a future bridge, and bounded run/agent observability events flow through a default no-op sink. This does **not** unify execution: workflow `agent()` still uses the legacy Pi-only runner, so C1 execution unification remains not started.
 
 ---
 
@@ -448,25 +448,34 @@ results.
 
 ---
 
-### Task C0 — Observability contracts and run-level workflow events — not started
+### Task C0 — Observability contracts and run-level workflow events — completed 2026-08-21
 
-The metadata/delivery groundwork described in §3 is implemented, but it does not include C0 durable IDs, an observability envelope/sink, or workflow run events.
+Implemented and verified:
 
-Before changing workflow execution, add only the event/identity seams required by
-Task C1 and the staged observability plan in
-[`docs/observability-architecture.md`](docs/observability-architecture.md):
-
-- mint durable run/agent identity before `backend.spawn()` while keeping
+- the manager synchronously mints immutable `runId`, `agentId`, and initial
+  `turnId` metadata before backend availability or spawn work while preserving
   `sa-N`/`btw-N` as display IDs;
-- add a no-op, non-throwing observability sink boundary;
-- model workflow **run-level** phase/log/settle events;
-- keep agent lifecycle out of the workflow event vocabulary;
-- preserve current `WorkflowDetails` and manager snapshots as the live TUI
-  projections.
+- follow-ups keep the run/agent identity and advance the turn identity at the
+  first native `UserMessage`/`RunStarted` boundary, so backends that announce
+  the prompt first still attribute it to the new turn; backend-native role
+  reopen creates a fresh run/agent identity while existing native resume
+  metadata continues to link history;
+- a versioned, byte-bounded event envelope and shared `ObservabilitySink` seam
+  now have default no-op and bounded recording implementations;
+- manager events cover creation, run boundaries, finalized message/tool
+  metadata, usage/meta/error, and settlement without storing prompts,
+  transcript bodies, tool arguments/results, or streaming deltas;
+- workflow code emits only `workflow.started`, `workflow.phase`,
+  `workflow.log`, and `workflow.settled`; it emits no agent lifecycle events and
+  still uses the legacy runner until C1;
+- `WorkflowDetails` and manager snapshots remain the live in-memory TUI
+  projections, and observability failures cannot affect lifecycle or returns;
+- deterministic identity/order/bounds/fault-isolation tests and all repository
+  acceptance commands pass.
 
-C0 must not add a daemon, database, model-visible API, child-hook claim map, or a
-second agent lifecycle vocabulary. With a no-op sink, current behavior and tests
-must remain unchanged.
+C0 adds no daemon, database, persistence, redaction implementation,
+model-visible API, child-hook claim map, or second agent lifecycle vocabulary.
+The production sink remains no-op until the later staged producer/storage work.
 
 ---
 
@@ -539,7 +548,7 @@ Implement in this order only after C1 is accepted:
 #### D2 — Pi/manager ingestion, protected spool, and autostart
 
 - parent Pi hooks plus unified manager events are primary;
-- workflow events remain run-level phase/log/settle only;
+- workflow events remain run-level start/phase/log/settle only;
 - producer redaction, batching, bounded spool/replay, and per-project
   disable/metadata/rich policy;
 - subagents owns one guarded `ensureDaemon()` lifecycle; workflows never start a
@@ -719,3 +728,14 @@ Completed on 2026-08-20:
    - shared extraction/validation and per-turn state isolation;
    - structured results and schema errors in normalized snapshots and tool/result delivery;
    - role schema persistence and portable regression coverage.
+
+Completed on 2026-08-21:
+
+1. Task C0 observability contracts and run-level events:
+   - durable manager run/agent/turn identity before backend side effects;
+   - versioned bounded event contracts plus no-op/recording sink seams;
+   - normalized manager lifecycle events with metadata-only message/tool
+     capture, content-labelled diagnostics, and no streaming deltas;
+   - workflow run-only start/phase/log/settlement events;
+   - fault-isolation, identity, ordering, bounds, regression, smoke, and startup
+     verification.

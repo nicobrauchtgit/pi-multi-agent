@@ -13,6 +13,7 @@
 
 import { isDeepStrictEqual } from "node:util";
 import {
+  Cause,
   Context,
   Effect,
   Exit,
@@ -31,6 +32,7 @@ import type {
   RoleLeaseHandle,
   SpawnTask,
   SubagentEvent,
+  SubagentIdentity,
   SubagentOrigin,
   SubagentMeta,
   SubagentSnapshot,
@@ -43,6 +45,26 @@ import {
   SendError,
   SpawnError,
 } from "./domain.ts";
+import {
+  isWorkflowRunId,
+  mintAgentId,
+  mintEphemeralParentIdentity,
+  mintStandaloneRunId,
+  mintTurnId,
+  type TurnId,
+} from "../../shared/observability/ids.ts";
+import {
+  NOOP_OBSERVABILITY_SINK,
+  NoopObservabilitySinkLayer,
+  ObservabilitySinkService,
+  safeEmit,
+} from "../../shared/observability/sink.ts";
+import {
+  agentCreatedEvent,
+  agentSettledEvent,
+  spawnFailureEvents,
+  subagentEvent,
+} from "./observability.ts";
 
 export const MAX_RUNNING = 4;
 export const MAX_TRACKED = 64;
@@ -55,6 +77,13 @@ const MAX_TRANSCRIPT_ITEMS = 512;
 
 function bounded(text: string) {
   return text.slice(0, ERROR_TEXT_MAX_LENGTH);
+}
+
+function causeMessage(cause: Cause.Cause<unknown>): string {
+  const squashed = Cause.squash(cause);
+  if (squashed instanceof Error) return squashed.message || squashed.name;
+  const message = String(squashed);
+  return message || "Subagent spawn interrupted or failed";
 }
 
 function boundedTranscriptText(text: string) {
@@ -76,6 +105,7 @@ function appendTranscript(snapshot: MutableSnapshot, item: TranscriptItem) {
 /** Mutable snapshot; exposed to readers via the readonly SubagentSnapshot type. */
 interface MutableSnapshot {
   id: string;
+  identity: SubagentIdentity;
   origin: SubagentOrigin;
   autoDeliver: boolean;
   workflowRunId?: string;
@@ -114,6 +144,14 @@ interface Entry {
   /** Idle restart dispatched but RunStarted not folded yet; counts as running
    * so concurrent restarts cannot race past the cap. */
   restarting?: boolean;
+  /** Minted before an idle backend send and promoted at its first boundary. */
+  pendingTurnId?: TurnId;
+  /** UserMessage arrived before RunStarted and already promoted pendingTurnId. */
+  turnPromotedBeforeRunStart?: boolean;
+  /** Native RunStarted boundaries observed for this manager entry. */
+  runCount: number;
+  /** Start time of the current native run, for per-turn settlement duration. */
+  runStartedAt?: number;
 }
 
 // --- Read model ----------------------------------------------------------------
@@ -202,6 +240,7 @@ export class SubagentManager extends Context.Service<
 
 const makeManager = Effect.gen(function* () {
   const registry = yield* BackendRegistry;
+  const observabilitySink = yield* ObservabilitySinkService;
   // Detached forker for sync contexts (read-model commands, pruning) that
   // preserves the manager's services instead of using the global runtime.
   const runDetached = Effect.runForkWith(yield* Effect.context());
@@ -220,6 +259,21 @@ const makeManager = Effect.gen(function* () {
   let disposed = false;
   let onSettled:
     ((snap: SubagentSnapshot, consumed: boolean) => void) | undefined;
+
+  type PendingEvent = Parameters<typeof observabilitySink.emit>[0];
+  const observe = (
+    build: () => PendingEvent | ReadonlyArray<PendingEvent> | undefined,
+  ) => {
+    if (observabilitySink === NOOP_OBSERVABILITY_SINK) return;
+    try {
+      const built = build();
+      if (!built) return;
+      const events = Array.isArray(built) ? built : [built];
+      for (const event of events) safeEmit(observabilitySink, event);
+    } catch {
+      // Normalization and sink bugs are both outside manager lifecycle state.
+    }
+  };
 
   const notify = (id?: string) => {
     const waiters = changeWaiters;
@@ -329,7 +383,7 @@ const makeManager = Effect.gen(function* () {
         break;
       case "Interrupted":
         s.status = "error";
-        s.errorText = "Run was aborted";
+        s.errorText = bounded(outcome.errorText ?? "Run was aborted");
         s.structured = undefined;
         s.schemaError = undefined;
         s.finalText = (outcome.partialText ?? "").slice(
@@ -350,6 +404,15 @@ const makeManager = Effect.gen(function* () {
     } catch {
       // The parent session may be unavailable; settlement stays final.
     }
+    observe(() =>
+      agentSettledEvent(
+        s,
+        outcome,
+        entry.runCount,
+        entry.runStartedAt ?? s.createdAt,
+      ),
+    );
+    entry.turnPromotedBeforeRunStart = false;
     pruneSettled();
   };
 
@@ -357,6 +420,19 @@ const makeManager = Effect.gen(function* () {
     const s = entry.snapshot;
     switch (event._tag) {
       case "RunStarted":
+        if (entry.runCount > 0) {
+          if (entry.turnPromotedBeforeRunStart) {
+            entry.turnPromotedBeforeRunStart = false;
+          } else {
+            s.identity = Object.freeze({
+              ...s.identity,
+              turnId: entry.pendingTurnId ?? mintTurnId(),
+            });
+            entry.pendingTurnId = undefined;
+          }
+        }
+        entry.runCount++;
+        entry.runStartedAt = Date.now();
         entry.restarting = false;
         s.status = "running";
         s.settledAt = undefined;
@@ -370,6 +446,17 @@ const makeManager = Effect.gen(function* () {
         settle(entry, event.outcome);
         return; // settle() already notified
       case "UserMessage":
+        // Codex and the stub announce a follow-up prompt before RunStarted.
+        // Promote the pending identity first so the prompt is never bucketed
+        // under the previous turn; RunStarted then preserves this identity.
+        if (entry.runCount > 0 && entry.pendingTurnId) {
+          s.identity = Object.freeze({
+            ...s.identity,
+            turnId: entry.pendingTurnId,
+          });
+          entry.pendingTurnId = undefined;
+          entry.turnPromotedBeforeRunStart = true;
+        }
         appendTranscript(s, {
           kind: "user",
           text: boundedTranscriptText(event.text),
@@ -467,21 +554,57 @@ const makeManager = Effect.gen(function* () {
 
   const spawn = (backendName: BackendName, task: SpawnTask) =>
     Effect.gen(function* () {
-      // Reserve synchronously (before the first yield inside doSpawn) so
-      // parallel tool calls cannot race past the global cap.
+      let reservedAt = 0;
+      let reservedTask!: SpawnTask & { readonly identity: SubagentIdentity };
+      // Reserve and mint synchronously before availability probing or backend
+      // spawn, so parallel calls cannot race either the cap or durable IDs.
       yield* Effect.suspend(
         (): Effect.Effect<void, SpawnError | ConcurrencyLimitError> => {
+          const rejectBeforeReservation = <E>(error: E) => {
+            task.roleLease?.release();
+            return error;
+          };
           if (disposed) {
-            return new SpawnError({
-              message: "Subagent manager is shutting down.",
-            });
+            return rejectBeforeReservation(
+              new SpawnError({
+                message: "Subagent manager is shutting down.",
+              }),
+            );
           }
           if (runningCount() + reserved >= MAX_RUNNING) {
-            return new ConcurrencyLimitError({
-              message: `Max ${MAX_RUNNING} subagents can run concurrently. Wait for one to finish before spawning another.`,
-            });
+            return rejectBeforeReservation(
+              new ConcurrencyLimitError({
+                message: `Max ${MAX_RUNNING} subagents can run concurrently. Wait for one to finish before spawning another.`,
+              }),
+            );
           }
+          const origin = task.origin ?? "model";
+          if (origin === "workflow" && !isWorkflowRunId(task.workflowRunId)) {
+            return rejectBeforeReservation(
+              new SpawnError({
+                message:
+                  'Workflow-origin subagents require a valid workflowRunId ("wf_" plus 12 lowercase hex characters).',
+              }),
+            );
+          }
+          const fallbackParent = mintEphemeralParentIdentity();
+          const identity: SubagentIdentity = Object.freeze({
+            runId:
+              origin === "workflow"
+                ? task.workflowRunId!
+                : mintStandaloneRunId(),
+            agentId: mintAgentId(),
+            turnId: mintTurnId(),
+            origin,
+            parentRunId: task.parent.rootRunId ?? fallbackParent.rootRunId,
+            traceId: task.parent.traceId ?? fallbackParent.traceId,
+          });
+          reservedTask = Object.freeze({ ...task, identity });
+          reservedAt = Date.now();
           reserved++;
+          observe(() =>
+            agentCreatedEvent(backendName, reservedTask, reservedAt),
+          );
           return Effect.void;
         },
       );
@@ -501,9 +624,10 @@ const makeManager = Effect.gen(function* () {
         }
 
         const scope = yield* Scope.make();
-        const session = yield* Scope.provide(backend.spawn(task), scope).pipe(
-          Effect.onError(() => Scope.close(scope, Exit.void)),
-        );
+        const session = yield* Scope.provide(
+          backend.spawn(reservedTask),
+          scope,
+        ).pipe(Effect.onError(() => Scope.close(scope, Exit.void)));
         if (disposed) {
           yield* Scope.close(scope, Exit.void);
           return yield* new SpawnError({
@@ -511,29 +635,30 @@ const makeManager = Effect.gen(function* () {
           });
         }
 
-        const origin = task.origin ?? "model";
+        const origin = reservedTask.identity.origin;
         const autoDeliver =
           origin === "workflow"
             ? false
-            : (task.autoDeliver ?? origin === "model");
+            : (reservedTask.autoDeliver ?? origin === "model");
         const id =
           origin === "btw" ? `btw-${++btwCounter}` : `sa-${++modelCounter}`;
         const meta = yield* session.meta;
         const entry: Entry = {
           snapshot: {
             id,
+            identity: reservedTask.identity,
             origin,
             autoDeliver,
-            workflowRunId: task.workflowRunId,
-            workflowAgentIndex: task.workflowAgentIndex,
-            workflowPhase: task.workflowPhase,
-            workflowLabel: task.workflowLabel,
+            workflowRunId: reservedTask.workflowRunId,
+            workflowAgentIndex: reservedTask.workflowAgentIndex,
+            workflowPhase: reservedTask.workflowPhase,
+            workflowLabel: reservedTask.workflowLabel,
             backend: backendName,
-            title: task.title,
-            prompt: task.prompt,
-            cwd: task.cwd,
-            role: task.role,
-            schema: task.schema,
+            title: reservedTask.title,
+            prompt: reservedTask.prompt,
+            cwd: reservedTask.cwd,
+            role: reservedTask.role,
+            schema: reservedTask.schema,
             status: "running",
             createdAt: Date.now(),
             meta,
@@ -546,8 +671,9 @@ const makeManager = Effect.gen(function* () {
           },
           session,
           scope,
-          roleLease: task.roleLease,
+          roleLease: reservedTask.roleLease,
           liveToolMap: new Map(),
+          runCount: 0,
         };
         entries.set(id, entry);
 
@@ -555,7 +681,10 @@ const makeManager = Effect.gen(function* () {
         // scope, so closing the scope stops it. If the stream ends while the
         // subagent still looks running, the backend died out from under us.
         const pump = Stream.runForEach(session.events, (event) =>
-          Effect.sync(() => foldEvent(entry, event)),
+          Effect.sync(() => {
+            foldEvent(entry, event);
+            observe(() => subagentEvent(entry.snapshot, event, entry.runCount));
+          }),
         ).pipe(
           Effect.ensuring(
             Effect.sync(() => {
@@ -575,9 +704,17 @@ const makeManager = Effect.gen(function* () {
       });
 
       return yield* doSpawn.pipe(
-        Effect.onError(() =>
+        Effect.onError((cause) =>
           Effect.sync(() => {
-            task.roleLease?.release();
+            observe(() =>
+              spawnFailureEvents({
+                backend: backendName,
+                task: reservedTask,
+                createdAt: reservedAt,
+                message: causeMessage(cause),
+              }),
+            );
+            reservedTask.roleLease?.release();
           }),
         ),
         Effect.ensuring(
@@ -670,10 +807,10 @@ const makeManager = Effect.gen(function* () {
         // fallback ("Backend event stream ended unexpectedly") cannot win
         // the race and report the wrong terminal reason.
         yield* Effect.sync(() => {
-          settle(entry, { _tag: "Interrupted" });
-          entry.snapshot.errorText =
-            "Abort deadline exceeded; session was force-disposed";
-          notify(entry.snapshot.id);
+          settle(entry, {
+            _tag: "Interrupted",
+            errorText: "Abort deadline exceeded; session was force-disposed",
+          });
         });
         // Bound the close like disposeAll does: a stuck backend finalizer
         // must not hang cancel after the run is already settled.
@@ -746,6 +883,7 @@ const makeManager = Effect.gen(function* () {
         // Some backends resolve send() only after the new run has already
         // settled; a post-send tap would erase that fresh result.
         entry.restarting = true;
+        entry.pendingTurnId = mintTurnId();
         entry.snapshot.structured = undefined;
         entry.snapshot.schemaError = undefined;
         notify(entry.snapshot.id);
@@ -753,6 +891,8 @@ const makeManager = Effect.gen(function* () {
           Effect.onError(() =>
             Effect.sync(() => {
               entry.restarting = false;
+              entry.pendingTurnId = undefined;
+              notify(entry.snapshot.id);
             }),
           ),
         );
@@ -836,8 +976,15 @@ const makeManager = Effect.gen(function* () {
   });
 });
 
+export const SubagentManagerWithSink: Layer.Layer<
+  SubagentManager,
+  never,
+  BackendRegistry | ObservabilitySinkService
+> = Layer.effect(SubagentManager, makeManager);
+
+/** Default C0 manager: shared sink seam present, production behavior is no-op. */
 export const SubagentManagerLive: Layer.Layer<
   SubagentManager,
   never,
   BackendRegistry
-> = Layer.effect(SubagentManager, makeManager);
+> = SubagentManagerWithSink.pipe(Layer.provide(NoopObservabilitySinkLayer));

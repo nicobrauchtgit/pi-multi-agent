@@ -9,6 +9,7 @@
 
 import type { ModelRegistry } from "@earendil-works/pi-coding-agent";
 import { Data } from "effect";
+import type { AgentId, TurnId } from "../../shared/observability/ids.ts";
 
 export const BACKEND_NAMES = ["pi", "claude", "codex"] as const;
 export type BackendName = (typeof BACKEND_NAMES)[number];
@@ -35,10 +36,23 @@ export type ReasoningEffort = (typeof REASONING_EFFORTS)[number];
 
 export type SubagentStatus = "running" | "done" | "error";
 
+/** Durable manager-owned identity. Short sa-N/btw-N values remain display IDs. */
+export interface SubagentIdentity {
+  readonly runId: string;
+  readonly agentId: AgentId;
+  readonly turnId: TurnId;
+  readonly origin: SubagentOrigin;
+  readonly parentRunId: string;
+  readonly traceId: string;
+}
+
 /** Parent-session context resolved by the tool layer and passed opaquely. */
 export interface ParentContext {
   readonly parentCwd: string;
   readonly projectTrusted: boolean;
+  /** Additive observability correlation supplied by the parent Pi session. */
+  readonly traceId?: string;
+  readonly rootRunId?: string;
   /** Parent pi model, for the pi backend's "inherit" default. */
   readonly inheritedModel?: { readonly provider: string; readonly id: string };
   readonly inheritedThinkingLevel?: string;
@@ -59,6 +73,11 @@ export interface RoleLeaseHandle {
 }
 
 export interface SpawnTask {
+  /**
+   * Manager-owned immutable metadata supplied to backends. Caller-provided
+   * values are ignored and replaced during the synchronous spawn reservation.
+   */
+  readonly identity?: SubagentIdentity;
   /** Omitted for normal tool-driven spawns. */
   readonly origin?: SubagentOrigin;
   /** Whether settlement may enqueue a standalone parent follow-up result. */
@@ -160,7 +179,12 @@ export type RunOutcome =
       readonly partialText?: string;
       readonly schemaError?: string;
     }
-  | { readonly _tag: "Interrupted"; readonly partialText?: string };
+  | {
+      readonly _tag: "Interrupted";
+      readonly partialText?: string;
+      /** Optional manager/backend-specific terminal reason. */
+      readonly errorText?: string;
+    };
 
 /**
  * Normalized activity stream. Previews (`argsPreview`, `outputPreview`) are
@@ -223,6 +247,7 @@ export type SubagentEvent =
  */
 export interface SubagentSnapshot {
   readonly id: string;
+  readonly identity: SubagentIdentity;
   readonly origin: SubagentOrigin;
   /** Whether settlement may enqueue a standalone parent follow-up result. */
   readonly autoDeliver: boolean;

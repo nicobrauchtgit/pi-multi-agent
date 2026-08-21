@@ -36,6 +36,10 @@ import {
 import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type, type Static } from "typebox";
 import { formatActivityStatus } from "../shared/activity-status.ts";
+import {
+  NOOP_OBSERVABILITY_SINK,
+  type ObservabilitySink,
+} from "../shared/observability/sink.ts";
 import { createWorkflowPersistence, persistWorkflowJson } from "./artifacts.ts";
 import { RunController } from "./controller.ts";
 import { sessionWorkflowRunIds, showWorkflowDashboard } from "./dashboard.ts";
@@ -44,6 +48,7 @@ import {
   prepareWorkflowScript,
   type WorkflowMeta,
 } from "./meta.ts";
+import { createWorkflowRunEmitter } from "./observability.ts";
 import {
   agentContext,
   aggregateUsage,
@@ -246,7 +251,10 @@ function runDetailText(
   }
 }
 
-export default function workflows(pi: ExtensionAPI) {
+export default function workflows(
+  pi: ExtensionAPI,
+  observabilitySink: ObservabilitySink = NOOP_OBSERVABILITY_SINK,
+) {
   /** Live background runs, for /workflows and shutdown cleanup. */
   const activeRuns = new Map<
     string,
@@ -412,6 +420,12 @@ export default function workflows(pi: ExtensionAPI) {
         agents: [],
         logs: [],
       };
+      const workflowEvents = createWorkflowRunEmitter({
+        runId,
+        sessionId: details.sessionId,
+        cwd: ctx.cwd,
+        sink: observabilitySink,
+      });
 
       writeRunFile(runDir, "script.js", params.script);
       if (params.args !== undefined)
@@ -468,6 +482,7 @@ export default function workflows(pi: ExtensionAPI) {
         if (details.logs.length > WORKFLOW_LOG_MAX_LINES) {
           details.logs.splice(0, details.logs.length - WORKFLOW_LOG_MAX_LINES);
         }
+        workflowEvents.log(text);
         emit();
       };
 
@@ -476,6 +491,7 @@ export default function workflows(pi: ExtensionAPI) {
         details.currentPhase = text;
         if (!details.phases.some((p) => p.title === text))
           details.phases.push({ title: text });
+        workflowEvents.phase(details, text);
         emit();
       };
 
@@ -641,47 +657,60 @@ export default function workflows(pi: ExtensionAPI) {
       const runScript = async () => {
         let status: WorkflowDetails["status"] = "completed";
         try {
-          const sandboxOptions = {
-            source: prepared.source,
-            args,
-            cwd: ctx.cwd,
-            signal: controller.signal,
-            onAgent: agentFn,
-            onPhase: phaseFn,
-            onLog: appendLog,
-          };
-          details.result = await runWorkflowSandbox(sandboxOptions);
-        } catch (error) {
-          details.error = errorText(error);
-          status = controller.signal.aborted ? "aborted" : "failed";
-          controller.abort("Workflow script failed");
-        }
+          try {
+            const sandboxOptions = {
+              source: prepared.source,
+              args,
+              cwd: ctx.cwd,
+              signal: controller.signal,
+              onAgent: agentFn,
+              onPhase: phaseFn,
+              onLog: appendLog,
+            };
+            details.result = await runWorkflowSandbox(sandboxOptions);
+          } catch (error) {
+            details.error = errorText(error);
+            status = controller.signal.aborted ? "aborted" : "failed";
+            controller.abort("Workflow script failed");
+          }
 
-        const settled = await controller.settle({
-          abort: status !== "completed",
-        });
-        if (!settled) {
-          status = "failed";
-          details.error = details.error
-            ? `${details.error}; agent shutdown deadline exceeded`
-            : "Agent shutdown deadline exceeded";
-        }
-        for (const record of details.agents) {
-          if (record.state !== "running") continue;
-          record.state = "error";
-          record.error =
-            record.error ?? "Agent did not settle before run cleanup";
-          record.finishedAt = Date.now();
-        }
-        details.status = status;
-        details.finishedAt = Date.now();
-        try {
-          persistence.flush();
-        } catch (error) {
-          details.status = "failed";
-          details.error = `Artifact persistence failed: ${errorText(error)}`;
-          throw new Error(details.error);
+          const settled = await controller.settle({
+            abort: status !== "completed",
+          });
+          if (!settled) {
+            status = "failed";
+            details.error = details.error
+              ? `${details.error}; agent shutdown deadline exceeded`
+              : "Agent shutdown deadline exceeded";
+          }
+          for (const record of details.agents) {
+            if (record.state !== "running") continue;
+            record.state = "error";
+            record.error =
+              record.error ?? "Agent did not settle before run cleanup";
+            record.finishedAt = Date.now();
+          }
+          details.status = status;
+          details.finishedAt = Date.now();
+          try {
+            persistence.flush();
+          } catch (error) {
+            details.status = "failed";
+            details.error = `Artifact persistence failed: ${errorText(error)}`;
+            throw new Error(details.error);
+          }
         } finally {
+          if (details.status === "running") {
+            details.status =
+              status === "completed"
+                ? controller.signal.aborted
+                  ? "aborted"
+                  : "failed"
+                : status;
+            details.finishedAt = Date.now();
+            details.error ??= "Workflow terminated before normal settlement";
+          }
+          workflowEvents.settled(details);
           flushNow();
         }
       };
@@ -694,6 +723,9 @@ export default function workflows(pi: ExtensionAPI) {
         completion?: Promise<void>;
       };
       activeRuns.set(runId, activeRun);
+      // Publish only after synchronous initialization. From this point onward,
+      // runScript()'s finally guarantees a matching workflow.settled event.
+      workflowEvents.started(details);
       const completion = runScript();
       activeRun.completion = completion;
       if (ctx.hasUI) lastUi = ctx.ui;

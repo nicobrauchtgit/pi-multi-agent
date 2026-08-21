@@ -107,6 +107,14 @@ test("settlement role updates preserve the session schema", () => {
     const schema = { type: "object", properties: { ok: { type: "boolean" } } };
     const snapshot = {
       id: "sa-1",
+      identity: {
+        runId: "sa_00000000-0000-4000-8000-000000000001",
+        agentId: "agent_00000000-0000-4000-8000-000000000001",
+        turnId: "turn_00000000-0000-4000-8000-000000000001",
+        origin: "model",
+        parentRunId: "pi-run:test",
+        traceId: "pi-session:test",
+      },
       origin: "model",
       autoDeliver: true,
       backend: "pi",

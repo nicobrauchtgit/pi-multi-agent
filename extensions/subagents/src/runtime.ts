@@ -12,6 +12,11 @@ import { claudeBackend } from "./backends/claude.ts";
 import { codexBackend } from "./backends/codex.ts";
 import { piBackend } from "./backends/pi.ts";
 import type { BackendName } from "./domain.ts";
+import {
+  NOOP_OBSERVABILITY_SINK,
+  ObservabilitySinkService,
+  type ObservabilitySink,
+} from "../../shared/observability/sink.ts";
 
 const BackendRegistryLive = Layer.sync(BackendRegistry, () => {
   const backends: SubagentBackend[] = [piBackend, claudeBackend, codexBackend];
@@ -20,12 +25,16 @@ const BackendRegistryLive = Layer.sync(BackendRegistry, () => {
   );
 });
 
-import { SubagentManagerLive } from "./manager.ts";
+import { SubagentManagerWithSink } from "./manager.ts";
 
-const AppLayer = SubagentManagerLive.pipe(Layer.provide(BackendRegistryLive));
-
-export function createSubagentRuntime() {
-  return ManagedRuntime.make(AppLayer);
+export function createSubagentRuntime(
+  observabilitySink: ObservabilitySink = NOOP_OBSERVABILITY_SINK,
+) {
+  const appLayer = SubagentManagerWithSink.pipe(
+    Layer.provide(BackendRegistryLive),
+    Layer.provide(Layer.succeed(ObservabilitySinkService, observabilitySink)),
+  );
+  return ManagedRuntime.make(appLayer);
 }
 
 export type SubagentRuntime = ReturnType<typeof createSubagentRuntime>;

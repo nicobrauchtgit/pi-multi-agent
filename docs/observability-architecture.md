@@ -1,6 +1,6 @@
 # Observability architecture
 
-_Status: accepted implementation plan; intentionally staged_  
+_Status: accepted staged plan; C0 implemented, C1 and D phases not started_
 _Last updated: 2026-08-21_
 
 This document is the canonical plan for local observability in Pi Multi-Agent. It is specific enough to implement, but it deliberately avoids building the final analytics platform before the first useful slice has been dogfooded.
@@ -45,7 +45,7 @@ Polling is sufficient until measured UI use shows otherwise. Bounded content rem
 2. **One SQLite writer.** The daemon is the only live writer and uses WAL mode. Offline purge may write only after acquiring the same daemon lock while the daemon is stopped.
 3. **Hooks and manager events are primary.** Artifacts are recovery and enrichment inputs and never override a known authoritative manager or Pi-hook fact.
 4. **One workflow-agent vocabulary.** C1 fully removes the legacy workflow child-runner path before any database phase begins.
-5. **Clear C0/C1 ownership.** C0 workflow events describe only run-level phase/log/settle. After C1, all workflow-owned agent lifecycle, messages, tools, usage, and settlement come only from `SubagentManager`.
+5. **Clear C0/C1 ownership.** C0 workflow events describe only run-level start/phase/log/settle. After C1, all workflow-owned agent lifecycle, messages, tools, usage, and settlement come only from `SubagentManager`.
 6. **Durable identity precedes child work.** Manager-owned `runId`, `agentId`, origin, and workflow linkage are minted before `backend.spawn()`. V1 observes child activity at the manager boundary. Exact attribution of child-extension hooks is deferred until Pi exposes a per-session, non-racy context that is available before the child's `session_start`.
 7. **No unredacted observability shadow.** The producer redacts before spooling or writing new observability artifacts. The daemon independently re-redacts all accepted payloads, including unknown event kinds. Existing native/session artifacts may predate this system; reconciliation never copies them without redaction.
 8. **Every stored byte was scanned.** Oversized requests or non-content envelopes are rejected before persistence. Oversized content fields are fully scanned, bounded/truncated, and fully scanned again; field-cap overflow alone does not discard the event.
@@ -60,8 +60,8 @@ The plan relies on current repository behavior rather than a hypothetical rewrit
 
 - `extensions/subagents/src/domain.ts` defines the normalized event union used by Pi, Claude, and Codex backends.
 - `SubagentManager` is already the single consumer that folds those events into live snapshots.
-- Current `sa-N` and `btw-N` identifiers are process-local and are allocated after `backend.spawn()`; C0 must add separate durable IDs allocated before spawn while retaining those short IDs for display.
-- Task C groundwork already carries workflow origin/ownership metadata through manager snapshots, suppresses standalone auto-delivery for workflow-origin agents, and exposes manager wait/get delivery seams. These are preparatory seams only: C0 durable identity/events and C1 execution unification have not started.
+- Current `sa-N` and `btw-N` identifiers remain process-local display IDs allocated after `backend.spawn()`. C0 added separate durable run/agent/turn IDs in the synchronous reservation before backend availability and spawn side effects.
+- Task C groundwork carries workflow origin/ownership metadata through manager snapshots, suppresses standalone auto-delivery for workflow-origin agents, and exposes manager wait/get delivery seams. C0 durable identity, envelope/sink contracts, manager events, and workflow run events are implemented; C1 execution unification has not started.
 - Workflow `agent()` currently bypasses the manager and uses `extensions/workflows/runner.ts`; C1 retires that execution path.
 - Workflow state is currently mutated directly in `extensions/workflows/index.ts` and persisted as bounded `workflow.json`, `result.json`, and `transcripts.json` files.
 - Current workflow artifacts are bounded and atomically written, but they do not redact content.
@@ -75,7 +75,7 @@ The plan relies on current repository behavior rather than a hypothetical rewrit
                               primary events
  Parent Pi hooks ───────────────────────────────────────────┐
                                                            │
- Workflow run reducer (phase/log/settle only) ──────────────┤
+ Workflow run reducer (start/phase/log/settle only) ────────┤
                                                            v
  Workflow agent() ── C1 ──> SubagentManager ─────────> Producer sink
                                 │                          │
@@ -120,7 +120,7 @@ Externally supplied or backend-native IDs are bounded opaque data and are never 
 - Every workflow `agent()` call uses the workflow `runId`, gets a manager-minted `agentId`, and records `origin: "workflow"` plus `workflowRunId`.
 - Follow-ups reuse `agentId` and mint a new `turnId`.
 
-C0 changes manager reservation so durable IDs and origin exist before `backend.spawn(task)`. The IDs travel in immutable spawn metadata and are also present when manager events are observed. V1 does **not** claim child-extension hook events by writing a map after session construction or by mutating a process-wide environment variable; either approach can race under parallel children.
+C0 changed manager reservation so durable IDs and origin exist before backend availability checks and `backend.spawn(task)`. The IDs travel in immutable spawn metadata and are also present when manager events are observed. V1 does **not** claim child-extension hook events by writing a map after session construction or by mutating a process-wide environment variable; either approach can race under parallel children.
 
 ## 7. Event contract
 
@@ -170,13 +170,13 @@ Rules:
 
 ### 7.2 V1 event ownership
 
-| Owner                      | Event kinds                                                                                                                                                     | Notes                                                                                                                                                                         |
-| -------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Parent Pi hooks            | `run.started`, `turn.started`, `message.user`, `message.assistant`, `tool.started`, `tool.finished`, `turn.settled`, `run.settled`, `session.compacted`         | Use `session_start`, `before_agent_start`, finalized message, agent/turn/tool lifecycle, compaction, and shutdown hooks. Hook failures are swallowed after health accounting. |
-| Workflow reducer in C0     | `workflow.phase`, `workflow.log`, `workflow.settled`                                                                                                            | Run-level only. Settlement carries the existing start/finish metadata; it never emits workflow-agent lifecycle events.                                                        |
-| `SubagentManager` after C1 | `agent.created`, `agent.run_started`, `agent.message`, `agent.tool_started`, `agent.tool_finished`, `agent.usage`, `agent.meta`, `agent.error`, `agent.settled` | Sole owner for standalone and workflow-owned agent lifecycle across all three harnesses.                                                                                      |
-| Reconciler                 | `artifact.observed`, `artifact.recovered`                                                                                                                       | Deterministic IDs, source marked `artifact`; fills gaps but does not overwrite primary facts.                                                                                 |
-| Producer/daemon            | `telemetry.dropped`, `telemetry.spool_overflow`, `telemetry.rejected`                                                                                           | Contains counts/reasons only, never rejected payload bytes.                                                                                                                   |
+| Owner                                                         | Event kinds                                                                                                                                                     | Notes                                                                                                                                                                         |
+| ------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Parent Pi hooks                                               | `run.started`, `turn.started`, `message.user`, `message.assistant`, `tool.started`, `tool.finished`, `turn.settled`, `run.settled`, `session.compacted`         | Use `session_start`, `before_agent_start`, finalized message, agent/turn/tool lifecycle, compaction, and shutdown hooks. Hook failures are swallowed after health accounting. |
+| Workflow reducer in C0                                        | `workflow.started`, `workflow.phase`, `workflow.log`, `workflow.settled`                                                                                        | Run-level only. Settlement carries the existing start/finish metadata; it never emits workflow-agent lifecycle events.                                                        |
+| `SubagentManager` (standalone in C0; workflow-owned after C1) | `agent.created`, `agent.run_started`, `agent.message`, `agent.tool_started`, `agent.tool_finished`, `agent.usage`, `agent.meta`, `agent.error`, `agent.settled` | Sole owner for normalized agent lifecycle across all three harnesses; workflow code never creates another agent vocabulary.                                                   |
+| Reconciler                                                    | `artifact.observed`, `artifact.recovered`                                                                                                                       | Deterministic IDs, source marked `artifact`; fills gaps but does not overwrite primary facts.                                                                                 |
+| Producer/daemon                                               | `telemetry.dropped`, `telemetry.spool_overflow`, `telemetry.rejected`                                                                                           | Contains counts/reasons only, never rejected payload bytes.                                                                                                                   |
 
 Streaming assistant deltas and repeated tool-progress updates are not durable v1 facts. `message.assistant` stores only a finalized parent assistant message; its payload may include separately bounded finalized thinking content when the hook exposes it safely. The sink may coalesce deltas for a live summary, but it persists finalized parent and agent messages, tool results, and lifecycle boundaries. This keeps the event log useful without turning token streaming into most of the database.
 
@@ -769,23 +769,27 @@ No D phase may begin until the C1 one-vocabulary gate passes.
 
 ### C0 — contracts, durable identity, and workflow run events
 
-Status: not started. The already-landed Task C workflow metadata, manager wait/get, and delivery-suppression seams are groundwork, not C0 completion and not evidence that workflow execution uses the manager.
+Status: completed 2026-08-21. This does not imply that workflow execution uses the manager; the C1 legacy-runner retirement gate remains open.
 
-Implement:
+Implemented:
 
-- stable IDs/envelope types and a no-op sink interface;
-- manager allocation of durable run/agent identity before backend spawn;
-- workflow events limited to run-level phase, log, and settle;
-- existing `WorkflowDetails` and manager snapshots as in-memory projections;
-- preserve and formalize the existing parent/child origin groundwork needed by C1, without a daemon or database;
-- leave `extensions/shared/dashboard-state.ts` untouched and do not reuse it for observability: it is an unrelated model/git dashboard channel utility, not a run/agent projection. Any dead-code deletion belongs to a separate cleanup.
+- exact-grammar locally minted IDs, additive snapshot/spawn identity, envelope v1 types, and a synchronous non-throwing sink contract with no-op and bounded recording implementations;
+- manager allocation of immutable durable run/agent/initial-turn identity in the synchronous reservation before backend availability and spawn side effects;
+- stable run/agent identity across follow-ups, turn advancement at the first native `UserMessage`/`RunStarted` boundary (covering backends that announce the prompt first), and fresh identity when persisted native role history is reopened;
+- normalized manager creation/run/message/tool/usage/meta/error/settlement events with metadata-only message/tool capture and no durable streaming deltas;
+- workflow events limited to run-level start, phase, log, and settle;
+- existing `WorkflowDetails` and manager snapshots retained as in-memory projections;
+- parent trace/root correlation supplied from the Pi session with a local non-session fallback;
+- `extensions/shared/dashboard-state.ts` left untouched and unused.
 
-Acceptance gate:
+Acceptance result:
 
-- existing behavior and tests remain unchanged with a no-op sink;
-- parallel spawns cannot start backend work before manager identity exists;
-- C0 has no workflow-agent lifecycle event kind;
-- no model-visible API is introduced.
+- existing behavior and tests remain unchanged with the default no-op sink;
+- deterministic tests prove identity precedes backend availability/spawn and remains unique under parallel calls;
+- workflow code has no workflow-agent lifecycle event kind and manager-owned workflow groundwork uses only `agent.*` kinds;
+- sink and event-builder faults are isolated from settlement, result delivery, cancellation, cleanup, and workflow returns;
+- no model-visible API, persistence, daemon, redaction implementation, or network behavior was introduced;
+- `npm test`, `npm run check`, `npm run format:check`, `npm run smoke`, and `PI_OFFLINE=1 pi --list-models` pass.
 
 Rollback: remove/disable the additive sink and ID plumbing. There is no persisted format yet.
 
@@ -982,5 +986,5 @@ Same-UID child agents may otherwise reach the Moshi socket/state, so §11's futu
 | Shared redaction              | One dependency-free `.mjs` implementation serves Pi and bare Node (§11).                                     |
 | C0 dashboard utility          | `dashboard-state.ts` is not reused or removed by C0 (§18).                                                   |
 | Incomplete projections        | Initialize at zero in memory and persist the triggering event sequence atomically (§10).                     |
-| Task C integration risks      | Deferred implementation guards are tracked in `BUGS.md`; groundwork does not mark C0 or C1 complete.         |
+| Task C integration risks      | Deferred C1/D implementation guards remain tracked in `BUGS.md`; C0 completion does not mark C1 complete.    |
 | Moshi interoperability        | Conceptual reuse and a future secondary importer only; no private-protocol dependency (§21).                 |
