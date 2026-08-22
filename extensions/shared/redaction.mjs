@@ -1,6 +1,6 @@
 import { Buffer } from "node:buffer";
 
-export const REDACTION_RULES_VERSION = 1;
+export const REDACTION_RULES_VERSION = 2;
 export const REDACTION_MARKERS = Object.freeze({
   header: "[REDACTED:header]",
   cookie: "[REDACTED:cookie]",
@@ -12,12 +12,12 @@ export const REDACTION_MARKERS = Object.freeze({
 
 const EXACT_MARKER = /^\[REDACTED:[a-z-]+\]$/;
 const SECRET_KEY =
-  /^(?:pass(?:word|wd)?|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|client[_-]?secret|aws[_-]?(?:secret[_-]?access[_-]?key|access[_-]?key[_-]?id)|auth(?:orization)?|proxy[_-]?authorization|x[_-]?(?:api[_-]?key|auth[_-]?token)|(?:access|refresh|id|session|auth)[_-]?token|bearer|credentials?|cookie|set-cookie)$/i;
+  /^(?:pass(?:word|wd)?|secret|token|api[_-]?key|account[_-]?key|access[_-]?key|private[_-]?key|client[_-]?secret|aws[_-]?(?:secret[_-]?access[_-]?key|access[_-]?key[_-]?id)|auth(?:orization)?|proxy[_-]?authorization|x[_-]?(?:api[_-]?key|auth[_-]?token)|(?:access|refresh|id|session|auth)[_-]?token|bearer|credentials?|cookie|set-cookie)$/i;
 const HEADER = /(authorization|proxy-authorization)(\s*:\s*)([^\r\n]*)/gi;
 const COOKIE = /(set-cookie|cookie)(\s*:\s*)([^\r\n]*)/gi;
 const BEARER = /bearer[ \t]+[A-Za-z0-9._~+\/-]{8,4096}/gi;
 const SECRET_ASSIGNMENT =
-  /(password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|client[_-]?secret|aws[_-]?(?:secret[_-]?access[_-]?key|access[_-]?key[_-]?id))\b([ \t]*(?:[:=][ \t]*|[ \t]+))("[^"\r\n]{0,4096}"|'[^'\r\n]{0,4096}'|[^\s,;\r\n]{1,4096})/gi;
+  /(password|passwd|pwd|secret|token|api[_-]?key|account[_-]?key|access[_-]?key|private[_-]?key|client[_-]?secret|aws[_-]?(?:secret[_-]?access[_-]?key|access[_-]?key[_-]?id))\b([ \t]*(?:[:=][ \t]*|[ \t]+))("[^"\r\n]{0,4096}"|'[^'\r\n]{0,4096}'|[^\s,;\r\n]{1,4096})/gi;
 // Distinctive credential prefixes intentionally have no leading word boundary.
 // Nested JSON escaping can put an ASCII hex digit immediately before a decoded
 // control character; relying on `\b` there recreates an in-band boundary bypass.
@@ -27,6 +27,10 @@ const AWS_ACCESS_KEY = /(?:AKIA|ASIA)[A-Z0-9]{16}\b/g;
 const NPM_TOKEN = /npm_[A-Za-z0-9]{36,255}\b/g;
 const SLACK_TOKEN = /xox[baprs]-[A-Za-z0-9-]{10,255}\b/g;
 const OPENAI_TOKEN = /sk-(?:proj-)?[A-Za-z0-9_-]{20,255}\b/g;
+const STRIPE_TOKEN = /sk_live_[A-Za-z0-9]{16,255}\b/g;
+const GOOGLE_API_KEY = /AIza[A-Za-z0-9_-]{20,255}(?=$|[^A-Za-z0-9_-])/g;
+const GITLAB_TOKEN = /glpat-[A-Za-z0-9_-]{20,255}(?=$|[^A-Za-z0-9_-])/g;
+const HEX_SECRET = /\b[A-Fa-f0-9]{64}\b/g;
 const JWT =
   /eyJ[A-Za-z0-9_-]{5,2048}\.[A-Za-z0-9_-]{5,4096}\.[A-Za-z0-9_-]{5,2048}\b/g;
 const CREDENTIAL_URL = /([A-Za-z][A-Za-z0-9+.-]{1,20}:\/\/)([^\s\/@]{1,769})@/g;
@@ -190,6 +194,34 @@ function redactText(input, counts) {
   value = replaceCounted(
     value,
     OPENAI_TOKEN,
+    REDACTION_MARKERS.token,
+    counts,
+    "token",
+  );
+  value = replaceCounted(
+    value,
+    STRIPE_TOKEN,
+    REDACTION_MARKERS.token,
+    counts,
+    "token",
+  );
+  value = replaceCounted(
+    value,
+    GOOGLE_API_KEY,
+    REDACTION_MARKERS.token,
+    counts,
+    "token",
+  );
+  value = replaceCounted(
+    value,
+    GITLAB_TOKEN,
+    REDACTION_MARKERS.token,
+    counts,
+    "token",
+  );
+  value = replaceCounted(
+    value,
+    HEX_SECRET,
     REDACTION_MARKERS.token,
     counts,
     "token",

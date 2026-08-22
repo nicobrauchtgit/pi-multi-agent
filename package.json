@@ -13,6 +13,7 @@
     "test:workflows": "node --test --experimental-strip-types extensions/workflows/sandbox.test.ts extensions/workflows/controller.test.ts extensions/workflows/meta.test.ts extensions/workflows/serialization.test.ts extensions/workflows/agent-bridge.test.ts extensions/workflows/artifacts.test.ts extensions/workflows/dashboard.test.ts extensions/workflows/extension-integration.test.ts extensions/workflows/observability.test.ts extensions/workflows/no-legacy-runner.test.ts",
     "test:live:backends": "npm --prefix extensions/subagents run test:live",
     "test:live:workflows": "RUN_LIVE_WORKFLOW_TESTS=1 node --test --experimental-strip-types extensions/workflows/live-workflows.test.ts",
+    "test:live:d3": "node companion/test/d3-live-chrome.mjs",
     "check": "tsc --noEmit -p tsconfig.json && npm run check:companion",
     "check:companion": "tsc --noEmit -p tsconfig.companion.json",
     "format": "prettier --write companion extensions docs MULTI_AGENT_HANDOVER.md README.md BUGS.md AGENTS.md tsconfig.companion.json",

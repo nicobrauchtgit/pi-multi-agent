@@ -97,6 +97,41 @@ test("secret-named JSON fields replace their complete subtree", () => {
   assert.equal(twice.counts.secretField, 0);
 });
 
+test("common provider tokens, account keys, and 64-hex values are redacted idempotently", () => {
+  const secrets = {
+    stripe: "sk_live_51Nabcdefghijklmnopqrstuv",
+    google: "AIzaSyD-abcdefghijklmnopqrstuvwxyz123456_",
+    gitlab: "glpat-abcdefghijklmnopqrstuvwxyz123_",
+    accountKey: "QWNjb3VudEtleVNlY3JldFZhbHVlMTIzNDU2Nzg5MA==",
+    hex64: "0123456789abcdef".repeat(4),
+  };
+  const source = [
+    secrets.stripe,
+    secrets.google,
+    secrets.gitlab,
+    `AccountKey=${secrets.accountKey}`,
+    secrets.hex64,
+  ].join("\n");
+  const once = redactString(source);
+  const twice = redactString(once.value);
+  for (const secret of Object.values(secrets)) {
+    assert.equal(once.value.includes(secret), false, secret);
+  }
+  assert.equal(twice.value, once.value);
+  assert.equal(
+    Object.values(twice.counts).reduce((sum, count) => sum + count, 0),
+    0,
+  );
+  assert.ok(once.counts.token >= 4);
+  assert.ok(once.counts.secretField >= 1);
+
+  const named = redactJson({ AccountKey: secrets.accountKey });
+  assert.equal(
+    (named.value as Record<string, unknown>).AccountKey,
+    REDACTION_MARKERS.secretField,
+  );
+});
+
 test("common authorization and token key variants suppress values", () => {
   const secret = "Basic U0VFRENBTkFSWV9LRVlfVkFSSUFOVF8xMTExMQ==";
   const keys = [

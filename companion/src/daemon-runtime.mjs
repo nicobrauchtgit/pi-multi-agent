@@ -1,9 +1,12 @@
 import * as http from "node:http";
 import { createConfigLoader } from "./config.mjs";
+import { createReadStatements } from "./db/read-statements.mjs";
 import { createStatements } from "./db/statements.mjs";
 import { checkpointAndClose, openDatabase } from "./db/open.mjs";
 import { verifyDatabaseFiles } from "./fsguard.mjs";
+import { createSizeSnapshot } from "./http/read.mjs";
 import { startHttpServer } from "./http/server.mjs";
+import { loadStaticAssets } from "./http/static.mjs";
 import { readLock, processIsAlive } from "./lock.mjs";
 import { createLogger } from "./log.mjs";
 import { quickCheckDatabase } from "./maintenance.mjs";
@@ -173,6 +176,9 @@ export async function runDaemon(paths, lock, options = {}) {
     const tokens = rotateTokens(paths);
     metrics = createMetrics(paths.metrics);
     const statements = createStatements(opened.db);
+    const readStatements = createReadStatements(opened.db);
+    const staticAssets = loadStaticAssets();
+    const sizeSnapshot = createSizeSnapshot(paths);
     metrics.set(
       "producerGaps",
       Number(statements.producerGapCount.get().value),
@@ -191,7 +197,11 @@ export async function runDaemon(paths, lock, options = {}) {
     server = await startHttpServer({
       db: opened.db,
       statements,
+      readStatements,
       ingestToken: tokens.ingest,
+      readToken: tokens.read,
+      staticAssets,
+      sizeSnapshot,
       metrics,
       logger,
       health,

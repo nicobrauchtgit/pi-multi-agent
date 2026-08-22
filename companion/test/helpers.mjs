@@ -91,6 +91,7 @@ export async function startDaemon(t, agentDir, extra = []) {
     }
   });
   const token = fs.readFileSync(paths.ingestToken, "utf8").trim();
+  const readToken = fs.readFileSync(paths.readToken, "utf8").trim();
   const stop = async (signal = "SIGTERM") => {
     if (child.exitCode === null && child.signalCode === null)
       child.kill(signal);
@@ -109,6 +110,7 @@ export async function startDaemon(t, agentDir, extra = []) {
     paths,
     state,
     token,
+    readToken,
     stop,
     stdout: () => stdout,
     stderr: () => stderr,
@@ -160,6 +162,19 @@ export function request(state, options = {}) {
     );
     req.on("error", reject);
     req.end(body);
+  });
+}
+
+export function readRequest(daemon, path, overrides = {}) {
+  return request(daemon.state, {
+    method: overrides.method ?? "GET",
+    path,
+    headers: {
+      Host: `127.0.0.1:${daemon.state.port}`,
+      Authorization: `Bearer ${overrides.token ?? daemon.readToken}`,
+      ...(overrides.headers ?? {}),
+    },
+    ...(overrides.body === undefined ? {} : { body: overrides.body }),
   });
 }
 

@@ -1,4 +1,4 @@
-export const REDACTION_RULES_VERSION: 1;
+export const REDACTION_RULES_VERSION: 2;
 export const REDACTION_MARKERS: Readonly<{
   header: string;
   cookie: string;

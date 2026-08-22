@@ -1,11 +1,15 @@
 import assert from "node:assert/strict";
 import * as fs from "node:fs";
+import { EventEmitter } from "node:events";
 import * as http from "node:http";
 import * as os from "node:os";
 import * as path from "node:path";
 import test from "node:test";
 import { observabilityPaths } from "../shared/observability/home.mjs";
-import { createDaemonController } from "./src/daemon-control.ts";
+import {
+  createDaemonController,
+  openObservabilityUi,
+} from "./src/daemon-control.ts";
 
 async function waitFor<T>(read: () => T | undefined, timeoutMs = 5_000) {
   const deadline = Date.now() + timeoutMs;
@@ -72,6 +76,15 @@ test("concurrent lazy cold starts coalesce and reuse exactly one temp daemon", a
   daemonPid = state.pid;
   assert.equal(await health(state.port), 200);
   assert.equal(controller.state.health, "healthy");
+  const uiUrl = await controller.readUiUrl();
+  const parsedUiUrl = new URL(uiUrl);
+  assert.equal(parsedUiUrl.hostname, "127.0.0.1");
+  assert.equal(parsedUiUrl.port, String(state.port));
+  assert.match(parsedUiUrl.hash, /^#[A-Za-z0-9_-]{43}$/);
+  assert.equal(
+    fs.readFileSync(paths.state, "utf8").includes(parsedUiUrl.hash.slice(1)),
+    false,
+  );
   assert.equal(
     transitions.filter((entry) => entry.startsWith("starting")).length,
     1,
@@ -80,6 +93,34 @@ test("concurrent lazy cold starts coalesce and reuse exactly one temp daemon", a
   const second = createDaemonController({ paths, autostart: true });
   assert.equal(await second.ensureDaemon(), true);
   assert.equal(JSON.parse(fs.readFileSync(paths.state, "utf8")).pid, daemonPid);
+});
+
+test("browser opener receives the fragment only as one argv value and returns no URL", async () => {
+  const calls: Array<{ command: string; args: readonly string[] }> = [];
+  let unrefCalled = false;
+  const spawnProcess = ((command: string, args: readonly string[]) => {
+    calls.push({ command, args });
+    const child = new EventEmitter() as EventEmitter & { unref(): void };
+    child.unref = () => {
+      unrefCalled = true;
+    };
+    queueMicrotask(() => child.emit("spawn"));
+    return child;
+  }) as never;
+  const token = "a".repeat(43);
+  const result = await openObservabilityUi(`http://127.0.0.1:1234/#${token}`, {
+    platform: "darwin",
+    spawnProcess,
+  });
+  assert.equal(result, undefined);
+  assert.deepEqual(calls, [
+    { command: "open", args: [`http://127.0.0.1:1234/#${token}`] },
+  ]);
+  assert.equal(unrefCalled, true);
+  await assert.rejects(
+    openObservabilityUi(`http://localhost:1234/#${token}`, { spawnProcess }),
+    /invalid-observability-url/,
+  );
 });
 
 test("exit 69 becomes permanent spool-only without a respawn loop", async (t) => {

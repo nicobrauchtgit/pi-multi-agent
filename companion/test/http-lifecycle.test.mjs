@@ -45,7 +45,7 @@ function runCli(args, env = {}) {
   });
 }
 
-test("health is minimal, ingest-only, loopback, and emits no permissive CORS", async (t) => {
+test("health stays minimal while D3 static/read surfaces remain loopback scoped", async (t) => {
   const agentDir = tempAgentDir(t);
   const daemon = await startDaemon(t, agentDir);
   const health = await request(daemon.state);
@@ -69,17 +69,17 @@ test("health is minimal, ingest-only, loopback, and emits no permissive CORS", a
   assert.equal(rebound.status, 400);
   assert.deepEqual(rebound.json, { error: "invalid-host" });
 
-  for (const path of [
-    "/",
-    "/v1/status",
-    "/v1/runs",
-    "/index.html",
-    "/v1/export",
-  ]) {
+  const shell = await request(daemon.state, { path: "/" });
+  assert.equal(shell.status, 200);
+  assert.match(shell.text, /Pi Multi-Agent Observability/);
+  for (const path of ["/v1/status", "/v1/runs", "/v1/export"]) {
     const response = await request(daemon.state, { path });
-    assert.equal(response.status, 404, path);
-    assert.equal(response.text, "");
+    assert.equal(response.status, 401, path);
+    assert.deepEqual(response.json, { error: "unauthorized" });
   }
+  const absent = await request(daemon.state, { path: "/index.html" });
+  assert.equal(absent.status, 404);
+  assert.equal(absent.text, "");
 });
 
 test("ingest enforces exact Host, bearer scope, origin, content type, and body/version bounds", async (t) => {
@@ -333,6 +333,11 @@ test("seeded credentials never appear in DB, WAL/SHM, logs, metrics, or response
     "SEEDCANARY_FFF_66666",
     "ghp_abcdefghijklmnopqrstuvwxyz123456",
     "sk-proj-ABCDEFGHIJKLMNOPQRSTUVWX",
+    "sk_live_51Nabcdefghijklmnopqrstuv",
+    "AIzaSyD-abcdefghijklmnopqrstuvwxyz123456_",
+    "glpat-abcdefghijklmnopqrstuvwxyz123_",
+    "QWNjb3VudEtleVNlY3JldFZhbHVlMTIzNDU2Nzg5MA==",
+    "0123456789abcdef".repeat(4),
   ];
   const seeded = event({
     kind: "future.secret.kind",
@@ -344,6 +349,11 @@ test("seeded credentials never appear in DB, WAL/SHM, logs, metrics, or response
       token: { raw: secrets[4] },
       url: `postgres://user:${secrets[5]}[REDACTED:x]@localhost/db`,
       boundary: `${"x".repeat(70 * 1024)} ${secrets[6]}`,
+      stripe: secrets[8],
+      google: secrets[9],
+      gitlab: secrets[10],
+      azure: `AccountKey=${secrets[11]}`,
+      genericHex: secrets[12],
     },
   });
   const oldSentinel = "\r\u0000redaction-json-boundary\u0000";

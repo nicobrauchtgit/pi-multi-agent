@@ -66,6 +66,7 @@ import {
 import { deriveBtwTitle, isModelVisible } from "./src/by-the-way.ts";
 import {
   createDaemonController,
+  openObservabilityUi,
   type DaemonController,
 } from "./src/daemon-control.ts";
 import { createParentHookObserver } from "./src/parent-hooks.ts";
@@ -1506,6 +1507,33 @@ export default function (pi: ExtensionAPI) {
       badge: "by the way",
     });
   };
+
+  pi.registerCommand("observability", {
+    description: "Open the local read-only observability UI",
+    handler: async (_args, ctx) => {
+      if (ctx.mode !== "tui") {
+        if (ctx.hasUI) {
+          ctx.ui.notify(
+            "The observability browser command is only available in the local TUI.",
+            "error",
+          );
+        }
+        return;
+      }
+      try {
+        initializeService();
+        if (!daemonController) throw new Error("observability-disabled");
+        const url = await daemonController.readUiUrl();
+        await openObservabilityUi(url);
+        ctx.ui.notify("Opened the local read-only observability UI.", "info");
+      } catch {
+        ctx.ui.notify(
+          "The local observability UI is unavailable. Orchestration is unaffected.",
+          "error",
+        );
+      }
+    },
+  });
 
   pi.registerCommand("btw", {
     description:

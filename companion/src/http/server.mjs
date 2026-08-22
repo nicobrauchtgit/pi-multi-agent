@@ -56,7 +56,16 @@ export async function startHttpServer(options) {
     sockets.add(socket);
     socket.once("close", () => sockets.delete(socket));
   });
-  server.on("clientError", (_error, socket) => {
+  server.on("clientError", (error, socket) => {
+    options.logger.write("client_error", {
+      code:
+        error &&
+        typeof error === "object" &&
+        "code" in error &&
+        typeof error.code === "string"
+          ? error.code
+          : "parse-error",
+    });
     socket.end(
       "HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
     );

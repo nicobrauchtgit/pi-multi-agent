@@ -40,6 +40,7 @@ Design preference from Nicolas:
 /subagents
 /workflows
 /btw
+/observability
 ```
 
 ### Tools
@@ -633,12 +634,21 @@ Rollback: set `~/.pi/agent/multi-agent/observability/config.json` top-level
 performs no autostart or spool-record writes, and keeps the C1 manager/workflow
 path unchanged. It never restores the deleted legacy runner.
 
-#### D3 — Read-only API and polling web UI
+#### D3 — Read-only API and polling web UI — completed 2026-08-24
 
-- authenticated run/agent/event/status/export reads;
-- static no-build UI served by the daemon;
-- sequence-cursor polling with retention-floor resync;
-- no web controls and no SSE until dogfood proves polling insufficient.
+Implemented and verified:
+
+- the existing single daemon now serves read-token-only `/v1/status`, bounded keyset run pages, run detail/agents, agent detail, and run/agent sequence-event pages; read and ingest capabilities remain timing-safe and mutually exclusive, and authentication precedes read route/query parsing;
+- the same synchronous `node:sqlite` connection handles every read in one await-free block. Schema v1, `user_version = 1`, three application tables, and all ten D1 indexes are unchanged; event queries demonstrate `events_run_seq`/`events_agent_seq`, while a new runs-list index is deferred to measured D5 tuning;
+- every list has strict allowlisted parameters, bound values, deterministic tie-breaks, row and byte caps, `currentSeq`/`minRetainedSeq`, and a `410 cursor-pruned` resnapshot contract. Malformed stored JSON becomes an explicit unavailable state and raw bytes are never reflected;
+- exactly `/`, `/app.js`, and `/app.css` are loaded from validated in-repository files at daemon startup and served from an in-memory allowlist with strict CSP, MIME, no-store/nosniff/no-referrer/frame/COOP/CORP/permissions protections. There is no request-derived path join, remote resource, inline execution, framework, build, or runtime dependency;
+- `/observability` is a non-model-visible TUI command. It opens a loopback fragment capability; the app validates and immediately removes that fragment, keeps it only in module memory, and uses bearer-authenticated same-origin fetches. A reload needs a new command invocation. No token enters queries, response bodies, DOM, web storage, logs, or console;
+- the vanilla UI provides runs with project/status/kind filters, run workflow/parent/agent lanes, agent detail, and system health. It shows loading, empty, read error, stale-cursor reload, daemon restart, metadata-only, redacted, omitted, truncated, unavailable, and recovered states; polling is scoped, non-overlapping, hidden-page paused, backoff-bounded, and not SSE;
+- API/static/security/UI helper suites and a live temp-home Helium pass cover parent/workflow plus Pi/Claude/Codex metadata events, every view, filters, empty/loading/error/restart states, screenshots, network/console/storage inspection, fragment removal, and clean browser/daemon shutdown.
+
+D3 has no export route. Redacted export remains D4 together with retention/purge and artifact work. `BUILD_VERSION` is now `0.3.0-d3`; stop a still-running D2 daemon before reuse. Producers remain in bounded spool mode during the rollout gap.
+
+Rollback: stop serving only read/static dispatch while ingestion/storage remains active, or use the existing D2 protected `"capture": "off"` switch. There is no schema rollback.
 
 #### D4 — Shared redacted artifacts and reconciliation
 
@@ -778,9 +788,9 @@ Rollback would involve moving current `extensions/{subagents,workflows,shared}` 
 - Manager-backed workflow transcripts intentionally contain bounded UI previews,
   not the deleted runner's fuller tool payloads; rich redacted transcripts and
   oversized explicit result preservation remain Task D (see `BUGS.md`).
-- D2 production observability is connected and defaults to metadata-only. The
-  daemon may be absent without affecting orchestration because the producer
-  uses the protected bounded spool. Read/UI remains D3; shared redacted
+- D3 read/UI is available through `/observability` and remains independent of
+  orchestration. The capability is memory-only and rotates with the daemon, so
+  browser reload requires invoking the command again. Shared redacted
   standalone/workflow artifacts, reconciliation, retention, purge, and export
   remain D4.
 - Rich capture is not currently available in production even if configured:
@@ -888,3 +898,12 @@ Completed on 2026-08-24:
    - wall-clock `received_at_ms` drift fix with daemon `seq` as sole order;
    - deterministic unit/subprocess/live-temp-daemon coverage without D3-D5 or
      model-visible surface.
+
+2. Task D3 authenticated read API and local polling UI:
+   - separate read-only bearer scope on status/run/agent/scoped-event routes;
+   - deterministic bounded SQL pages, watermarks, 410 floor recovery, and
+     malformed-row degradation on the unchanged three-table schema;
+   - startup-frozen three-asset vanilla UI with strict browser/HTTP hardening;
+   - fragment-to-memory `/observability` bootstrap and four read-only views;
+   - API/security/UI regression suites plus live Helium view/filter/error/restart
+     and token-surface acceptance with screenshots.

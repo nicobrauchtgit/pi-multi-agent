@@ -1,6 +1,6 @@
 # Observability architecture
 
-_Status: accepted staged plan; C0, C1, D1, and D2 implemented; D3-D5 not started_
+_Status: accepted staged plan; C0, C1, D1, D2, and D3 implemented; D4-D5 not started_
 _Last updated: 2026-08-24_
 
 This document is the canonical plan for local observability in Pi Multi-Agent. It is specific enough to implement, but it deliberately avoids building the final analytics platform before the first useful slice has been dogfooded.
@@ -527,14 +527,15 @@ The file-tool checks are defense in depth against model actions through supporte
 - Validate content type and request length before reading/parsing a body.
 - Use prepared statements and allowlisted sort/filter fields.
 - Serve strict CSP, `nosniff`, no-referrer, and no-store headers. Render captured strings with DOM `textContent`, never `innerHTML`.
-- A trusted parent command may open `http://127.0.0.1:<port>/#<read-token>`. The fragment is not sent in HTTP logs; the static app keeps it in memory and uses a bearer header. The read token cannot ingest or control. It rotates on daemon restart.
-- Browser-facing v1 has no purge, cancel, steer, retry, or configuration routes.
+- The non-model-visible `/observability` command opens `http://127.0.0.1:<port>/#<read-token>`. The app accepts only the 43-character base64url grammar, immediately removes the fragment with `history.replaceState(null, "", "/")`, keeps the capability only in module memory, and uses it only in an `Authorization` header. It is never put in a query, cookie, DOM node, web storage, console message, daemon log, or response. Reload without a fresh fragment fails visibly and makes no data request.
+- Any `Origin` on API, health, ingest, or document navigation is rejected. The ESM/CSS asset routes permit only the exact same loopback origin because Chromium sends it for module loading; every other asset origin is rejected. API/assets otherwise require absent or `same-origin` fetch metadata; the data-free `/` navigation additionally permits `Sec-Fetch-Site: none`, which Chromium sends for an address-bar/platform-opener navigation. API fetch destinations must be absent or `empty`. No CORS response header or preflight grant exists.
+- Browser-facing v1 has no purge, cancel, steer, retry, configuration, export, or other mutation route.
 
 ## 12. Read API, polling, and UI MVP
 
 ### 12.1 Routes
 
-D2 still exposes only `/healthz` and `/v1/ingest`; every data-read/static route below remains absent until D3.
+D3 adds the following read/static surface to the same D2 daemon and synchronous `node:sqlite` connection. It adds no connection, worker, table, index, migration, or write authority.
 
 Internal write route:
 
@@ -543,32 +544,35 @@ Internal write route:
 Read-only routes:
 
 - `GET /healthz`
-- `GET /v1/status` — schema/build, current/max sequence, retention floor, DB/spool sizes, redaction/drop/conflict counts;
+- `GET /v1/status` — schema/build, current/max sequence, retention floor, DB/WAL/SHM sizes, configured DB/spool caps, and redaction/drop/conflict counts;
 - `GET /v1/runs?projectId=&status=&kind=&beforeSeq=&limit=`;
 - `GET /v1/runs/:runId` — run projection plus agent summaries;
 - `GET /v1/runs/:runId/events?afterSeq=&limit=`;
 - `GET /v1/agents/:agentId` — agent projection;
 - `GET /v1/agents/:agentId/events?afterSeq=&limit=`;
-- `GET /v1/export?projectId=&runId=&afterSeq=&beforeSeq=` — streams already-redacted JSONL.
 
-IDs are parsed as bounded opaque values and passed only to prepared statements. Pagination limits are capped server-side.
+Static routes are exactly `GET /`, `GET /app.js`, and `GET /app.css`, loaded from an in-repository startup allowlist and then served from memory. `/v1/export` remains D4 with retention/purge; D3 deliberately has no export/download route.
+
+The read bearer is distinct from the ingest bearer and the scopes are disjoint. Authentication occurs before read-route matching or query/path parsing. IDs are bounded opaque UTF-8 values and are only SQL bindings. Query names are allowlisted; repeated, unknown, malformed, control-bearing, unsafe-integer, or over-limit values return `400`. Ordering is fixed: runs use `(last_seq DESC, run_id DESC)`, run agents use workflow index/start/agent-ID tie-breaks, and events use unique daemon `seq ASC`. Run pages are capped at 200, event pages at 500 plus a 1 MiB serialized stored-event budget, run agent lists at 500, and every JSON response at 4 MiB.
 
 ### 12.2 Cursor polling
 
 There is no global events-feed route in v1. A run or agent detail view loads its projection, records the returned global `currentSeq` watermark, then polls that entity's scoped `/events?afterSeq=` route every two seconds. The cursor advances to the greatest sequence actually returned for that scope; an empty response may also advance it to the response's `currentSeq`, because any skipped sequences belong to other scopes. The runs list and system-health views poll `/v1/runs` and `/v1/status` respectively and replace their projection snapshot when `currentSeq` advances; they do not attempt event-by-event folding.
 
-Every polling response includes `currentSeq` and `minRetainedSeq`. If retention has removed the requested range, the daemon returns `410` with the new floor and the UI reloads the relevant projection. This is the only v1 live-update contract. SSE may later reuse daemon sequence cursors if polling is measured to be inadequate; no full SSE protocol is committed now.
+Every polling response includes `currentSeq` and `minRetainedSeq`. `currentSeq` is the maximum of retained `events.seq` and the `sqlite_sequence` high-water, so it remains monotone after future retention; an empty retained log reports `minRetainedSeq = currentSeq + 1`. Omitting `afterSeq` starts at the retained floor and never returns `410`. A supplied cursor whose next sequence predates the floor returns `410 { error: "cursor-pruned", currentSeq, minRetainedSeq }`, and the UI reloads the projection.
+
+The client advances to the greatest returned sequence, advances to `currentSeq` only on an empty non-backlogged page, never overlaps polls, pauses while hidden, backs off from 2 to 30 seconds, and retains at most 2,000 detail events in memory with an explicit drop notice. This is the only v1 live-update contract. SSE may later reuse daemon sequence cursors if polling is measured to be inadequate; no SSE abstraction exists now.
 
 ### 12.3 UI information architecture
 
-The static no-build UI has four views:
+The static no-build HTML/CSS/ES-module UI has four views and no control/mutation action:
 
 1. **Runs:** project/status/kind filters; start time, duration, phase, agent counts, failure, redaction/truncation badges.
 2. **Run timeline:** workflow phases/logs, parent turns, agent lanes, tool durations, usage/meta changes, artifact-recovery markers.
 3. **Agent detail:** role/backend/model/native locator metadata, turns, bounded message/tool excerpts, structured-result metadata/preview and artifact reference, queue/failure history.
-4. **System health:** daemon/build/schema, DB/WAL/spool size, oldest retained time/sequence, dropped/conflicting events, redaction counts, disabled/metadata-only projects.
+4. **System health:** daemon/build/schema, DB/WAL/SHM size, configured spool cap, retained sequence floor, dropped/conflicting events, redaction counts, disabled/metadata-only projects.
 
-Diffs are absent until their attribution label is honest. Every content panel distinguishes `redacted`, `omitted by path policy`, `truncated`, and `unavailable`.
+Diffs are absent until their attribution label is honest. Every content panel distinguishes `metadata-only`, `redacted`, `omitted`, `truncated`, `unavailable`, and `recovered` using only stored capture/redaction/projection metadata. Captured values are inserted through `textContent`; there is no HTML sink, remote resource, service worker, framework, build step, or frontend dependency. Complete code, results, transcripts, artifacts, patches, and diffs are never reconstructed or resolved; an already-stored bounded excerpt or an existing artifact/VCS reference is the entire content boundary.
 
 ## 13. Artifact persistence and reconciliation
 
@@ -898,20 +902,24 @@ Rollback: set protected `config.json` top-level `"capture": "off"`. The service 
 
 ### D3 — read API, polling UI, and dogfood entry
 
-Implement:
+Status: completed 2026-08-24.
 
-- authenticated read routes and read-token separation;
-- static no-build UI with run, timeline, agent, and health views;
-- cursor polling and retention-floor resync;
-- browser/HTTP hardening.
+Implemented:
 
-Acceptance gate:
+- read-token-only status, keyset-paginated run, run detail/agents, agent detail, and run/agent sequence-event routes in the existing daemon; ingest/read bearer scopes remain timing-safe and mutually exclusive;
+- strict query/path grammar, bound prepared statements, deterministic ordering, monotone sequence/floor watermarks, 410 resnapshot semantics, row/byte/response caps, and malformed-stored-JSON degradation without raw-byte reflection;
+- exactly three startup-loaded static assets with no request-derived filesystem path, no cache validators, exact MIME, no-store/nosniff/no-referrer/frame/COOP/CORP/permissions headers, and a CSP with no inline or remote execution;
+- a fragment bootstrap removed immediately into module memory, bearer-only same-origin fetches, visible missing/expired-token behavior, and no token persistence or model-visible route;
+- runs/filter, run-lane timeline, agent detail, and system-health views with loading/empty/error/stale/restart states, honest capture badges, bounded cursor polling, no SSE, and no web control;
+- a non-model-visible `/observability` opener and deterministic API/security/UI tests plus real Helium/Chrome-DevTools acceptance screenshots.
 
-- no browser-facing mutation/control route exists;
-- stored-XSS, CORS/Host/Origin, token-scope, query, and polling-resync tests pass;
-- the tool can be dogfooded without SSE.
+Acceptance result:
 
-Rollback: stop serving static/read routes while ingestion/storage continues, or disable the daemon entirely through the D2 switch.
+- no browser-facing mutation/control/export route exists; hostile method sweeps leave the three-table store unchanged;
+- stored-XSS, Host/Origin/fetch-metadata, token scope/rotation/leak, strict query binding, pagination/floor, response budget, malformed row, polling/backoff, static traversal/header, and schema/index regression tests pass;
+- the UI was dogfooded against a real temporary daemon with parent/workflow and Pi/Claude/Codex metadata events, including every view, filters, empty/loading/error/restart states, network/console/storage inspection, and fragment removal, without SSE.
+
+Rollback: remove/disable only the static/read dispatch while ingestion/storage continues, or set the D2 protected config to `"capture": "off"`. `BUILD_VERSION` is `0.3.0-d3`, so a still-running D2 daemon must be stopped before D3 is reused; producers spool during that bounded rollout gap.
 
 ### D4 — redacted artifacts, reconciliation, retention, purge, and export
 
