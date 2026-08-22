@@ -1,4 +1,5 @@
 import * as http from "node:http";
+import { createConfigLoader } from "./config.mjs";
 import { createStatements } from "./db/statements.mjs";
 import { checkpointAndClose, openDatabase } from "./db/open.mjs";
 import { verifyDatabaseFiles } from "./fsguard.mjs";
@@ -7,6 +8,7 @@ import { readLock, processIsAlive } from "./lock.mjs";
 import { createLogger } from "./log.mjs";
 import { quickCheckDatabase } from "./maintenance.mjs";
 import { createMetrics } from "./metrics.mjs";
+import { createDaemonSpoolReplayer } from "./spool-replay.mjs";
 import {
   BUILD_VERSION,
   PROTOCOL_VERSION,
@@ -116,6 +118,7 @@ export async function runDaemon(paths, lock, options = {}) {
   });
   const logger = createLogger(paths.log);
   let metrics;
+  let spoolReplayer;
 
   const shutdown = async (reason) => {
     if (shuttingDown) return;
@@ -124,6 +127,7 @@ export async function runDaemon(paths, lock, options = {}) {
     try {
       if (server) await server.close();
     } finally {
+      spoolReplayer?.close();
       try {
         metrics?.flush();
       } catch {
@@ -164,12 +168,26 @@ export async function runDaemon(paths, lock, options = {}) {
     });
     verifyDatabaseFiles(paths);
     quickCheckDatabase(opened.db);
+    const config = createConfigLoader(paths.config);
+    config.current();
     const tokens = rotateTokens(paths);
     metrics = createMetrics(paths.metrics);
-    metrics.flush();
     const statements = createStatements(opened.db);
+    metrics.set(
+      "producerGaps",
+      Number(statements.producerGapCount.get().value),
+    );
+    metrics.flush();
+    spoolReplayer = createDaemonSpoolReplayer({
+      paths,
+      db: opened.db,
+      statements,
+      config,
+      metrics,
+    });
+    // Replay every producer directory before accepting newer live traffic.
+    await spoolReplayer.runOnce();
     const health = { ready: false, degraded: false };
-    let lastReceivedAt = 0;
     server = await startHttpServer({
       db: opened.db,
       statements,
@@ -177,12 +195,11 @@ export async function runDaemon(paths, lock, options = {}) {
       metrics,
       logger,
       health,
+      config,
       startedAt: lock.record.startedAt,
       idleMs: options.idleMs,
-      nextReceivedAt: () => {
-        lastReceivedAt = Math.max(lastReceivedAt + 129, Date.now());
-        return lastReceivedAt;
-      },
+      // Display-only batch time; events.seq remains the sole ordering authority.
+      nextReceivedAt: () => Date.now(),
       onIdle: () => requestShutdown("idle"),
     });
     if (pendingShutdownReason) {
@@ -211,6 +228,7 @@ export async function runDaemon(paths, lock, options = {}) {
     );
     await stopped;
   } catch (error) {
+    spoolReplayer?.close();
     if (server) {
       try {
         await server.close();

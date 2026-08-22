@@ -7,6 +7,7 @@ import {
   redactString,
 } from "../../extensions/shared/redaction.mjs";
 import { EXIT } from "../src/constants.mjs";
+import { createMetrics } from "../src/metrics.mjs";
 import { boundEncodedString } from "../src/ingest/normalize.mjs";
 import {
   SQLITE_REEXEC_SENTINEL,
@@ -109,6 +110,20 @@ test("recursive redaction scans keys, unknown values, and secret-named fields", 
   assert.ok(result.counts.secretField > 0);
   assert.ok(result.counts.header > 0);
   assert.ok(result.counts.token > 0);
+});
+
+test("metrics reject reasons are sanitized and cardinality bounded at increment time", (t) => {
+  const agentDir = tempAgentDir(t);
+  const file = `${agentDir}/metrics.json`;
+  const metrics = createMetrics(file);
+  for (let index = 0; index < 300; index++) {
+    metrics.reject(
+      index % 2 === 0 ? `reason-${index}` : `invalid reason/${index}`,
+    );
+  }
+  assert.ok(Object.keys(metrics.state.rejectedByReason).length <= 128);
+  assert.equal(Object.hasOwn(metrics.state.rejectedByReason, "invalid"), true);
+  assert.equal(Object.hasOwn(metrics.state.rejectedByReason, "other"), true);
 });
 
 test("redaction rules stay bounded on adversarial input", () => {

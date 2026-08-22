@@ -36,6 +36,8 @@ import {
   bindChildSessionExtensions,
   childToolPolicy,
   createChildResources,
+  createProtectedPathToolGuard,
+  protectedPathPolicy,
   shutdownAndDisposeChildSession,
 } from "../../../shared/child-session.ts";
 import {
@@ -347,6 +349,8 @@ const makePiSession = (
     };
 
     const toolTimeout = createToolCallTimeoutGuard();
+    const protectedPaths = createProtectedPathToolGuard(protectedPathPolicy());
+    protectedPaths.apply(session);
     toolTimeout.apply(session);
 
     const activeModel = (): Model<any> | undefined => {
@@ -446,6 +450,7 @@ const makePiSession = (
       switch (event.type) {
         case "agent_start":
           // Extensions may register tools between runs; guard new ones too.
+          protectedPaths.apply(session);
           toolTimeout.apply(session);
           // Pi can begin work through retry/continue/queued-follow-up paths
           // that do not call startRun(). Every native agent run therefore

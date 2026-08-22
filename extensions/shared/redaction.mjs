@@ -12,23 +12,24 @@ export const REDACTION_MARKERS = Object.freeze({
 
 const EXACT_MARKER = /^\[REDACTED:[a-z-]+\]$/;
 const SECRET_KEY =
-  /^(?:pass(?:word|wd)?|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|client[_-]?secret|aws[_-]?(?:secret[_-]?access[_-]?key|access[_-]?key[_-]?id)|auth(?:orization)?|cookie|set-cookie)$/i;
-const HEADER = /\b(authorization|proxy-authorization)(\s*:\s*)([^\r\n]*)/gi;
-const COOKIE = /\b(set-cookie|cookie)(\s*:\s*)([^\r\n]*)/gi;
-const BEARER = /\bbearer[ \t]+[A-Za-z0-9._~+\/-]{8,4096}/gi;
+  /^(?:pass(?:word|wd)?|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|client[_-]?secret|aws[_-]?(?:secret[_-]?access[_-]?key|access[_-]?key[_-]?id)|auth(?:orization)?|proxy[_-]?authorization|x[_-]?(?:api[_-]?key|auth[_-]?token)|(?:access|refresh|id|session|auth)[_-]?token|bearer|credentials?|cookie|set-cookie)$/i;
+const HEADER = /(authorization|proxy-authorization)(\s*:\s*)([^\r\n]*)/gi;
+const COOKIE = /(set-cookie|cookie)(\s*:\s*)([^\r\n]*)/gi;
+const BEARER = /bearer[ \t]+[A-Za-z0-9._~+\/-]{8,4096}/gi;
 const SECRET_ASSIGNMENT =
-  /\b(password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|client[_-]?secret|aws[_-]?(?:secret[_-]?access[_-]?key|access[_-]?key[_-]?id))\b([ \t]*[:=][ \t]*)("[^"\r\n]{0,4096}"|'[^'\r\n]{0,4096}'|[^\s,;\r\n]{1,4096})/gi;
+  /(password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|client[_-]?secret|aws[_-]?(?:secret[_-]?access[_-]?key|access[_-]?key[_-]?id))\b([ \t]*(?:[:=][ \t]*|[ \t]+))("[^"\r\n]{0,4096}"|'[^'\r\n]{0,4096}'|[^\s,;\r\n]{1,4096})/gi;
+// Distinctive credential prefixes intentionally have no leading word boundary.
+// Nested JSON escaping can put an ASCII hex digit immediately before a decoded
+// control character; relying on `\b` there recreates an in-band boundary bypass.
 const GITHUB_TOKEN =
-  /\b(?:gh[pousr]_[A-Za-z0-9]{20,255}|github_pat_[A-Za-z0-9_]{20,255})\b/g;
-const AWS_ACCESS_KEY = /\b(?:AKIA|ASIA)[A-Z0-9]{16}\b/g;
-const NPM_TOKEN = /\bnpm_[A-Za-z0-9]{36,255}\b/g;
-const SLACK_TOKEN = /\bxox[baprs]-[A-Za-z0-9-]{10,255}\b/g;
-const OPENAI_TOKEN = /\bsk-(?:proj-)?[A-Za-z0-9_-]{20,255}\b/g;
+  /(?:gh[pousr]_[A-Za-z0-9]{20,255}|github_pat_[A-Za-z0-9_]{20,255})\b/g;
+const AWS_ACCESS_KEY = /(?:AKIA|ASIA)[A-Z0-9]{16}\b/g;
+const NPM_TOKEN = /npm_[A-Za-z0-9]{36,255}\b/g;
+const SLACK_TOKEN = /xox[baprs]-[A-Za-z0-9-]{10,255}\b/g;
+const OPENAI_TOKEN = /sk-(?:proj-)?[A-Za-z0-9_-]{20,255}\b/g;
 const JWT =
-  /\beyJ[A-Za-z0-9_-]{5,2048}\.[A-Za-z0-9_-]{5,4096}\.[A-Za-z0-9_-]{5,2048}\b/g;
-const CREDENTIAL_URL =
-  /\b([A-Za-z][A-Za-z0-9+.-]{1,20}:\/\/)([^\s\/@]{1,769})@/g;
-const JSON_STRING_BOUNDARY = "\r\u0000redaction-json-boundary\u0000";
+  /eyJ[A-Za-z0-9_-]{5,2048}\.[A-Za-z0-9_-]{5,4096}\.[A-Za-z0-9_-]{5,2048}\b/g;
+const CREDENTIAL_URL = /([A-Za-z][A-Za-z0-9+.-]{1,20}:\/\/)([^\s\/@]{1,769})@/g;
 
 /** @returns {Record<string, number>} */
 export function emptyRedactionCounts() {
@@ -88,39 +89,6 @@ function replaceNamedSecret(value, pattern, marker, counts, rule) {
   });
 }
 
-function boundJsonStrings(input) {
-  try {
-    JSON.parse(input);
-  } catch {
-    return input;
-  }
-  let output = "";
-  let inString = false;
-  let escaped = false;
-  for (const character of input) {
-    if (!inString) {
-      output += character;
-      if (character === '"') inString = true;
-      continue;
-    }
-    if (escaped) {
-      output += character;
-      escaped = false;
-      continue;
-    }
-    if (character === "\\") {
-      output += character;
-      escaped = true;
-    } else if (character === '"') {
-      output += `${JSON_STRING_BOUNDARY}${character}`;
-      inString = false;
-    } else {
-      output += character;
-    }
-  }
-  return output;
-}
-
 /**
  * PEM scanning is index-based so an unterminated block cannot cause regex
  * backtracking over a large payload.
@@ -156,15 +124,13 @@ function redactPrivateKeys(input, counts) {
 }
 
 /**
- * Apply the fixed common-secret rules to one complete string.
+ * Apply rules to one isolated text region. JSON token boundaries are kept
+ * out-of-band by the caller; no payload-forgeable sentinel is ever inserted.
  * @param {string} input
- * @returns {{ value: string, counts: Record<string, number> }}
+ * @param {Record<string, number>} counts
  */
-export function redactString(input) {
-  const counts = emptyRedactionCounts();
-  if (input.length === 0) return { value: input, counts };
-
-  let value = redactPrivateKeys(boundJsonStrings(input), counts);
+function redactText(input, counts) {
+  let value = redactPrivateKeys(input, counts);
   value = replaceNamedSecret(
     value,
     HEADER,
@@ -229,12 +195,67 @@ export function redactString(input) {
     "token",
   );
   value = replaceCounted(value, JWT, REDACTION_MARKERS.token, counts, "token");
-  value = value.replace(CREDENTIAL_URL, (match, scheme, credentials) => {
+  return value.replace(CREDENTIAL_URL, (match, scheme, credentials) => {
     if (isExactMarker(credentials)) return match;
     counts.credentialUrl = (counts.credentialUrl ?? 0) + 1;
     return `${scheme}${REDACTION_MARKERS.credentialUrl}@`;
   });
-  return { value: value.replaceAll(JSON_STRING_BOUNDARY, ""), counts };
+}
+
+/**
+ * If input is valid JSON, decode and redact each string token independently
+ * while preserving all structural bytes. Re-encoding each token makes escape
+ * sequences visible to the scanner without any in-band boundary marker.
+ * Returning undefined means ordinary text should be scanned as a whole.
+ * @param {string} input
+ * @param {Record<string, number>} counts
+ */
+function redactJsonStringTokens(input, counts) {
+  try {
+    JSON.parse(input);
+  } catch {
+    return undefined;
+  }
+  let output = "";
+  let cursor = 0;
+  let stringStart = -1;
+  let escaped = false;
+  for (let index = 0; index < input.length; index++) {
+    const character = input[index];
+    if (stringStart < 0) {
+      if (character === '"') stringStart = index;
+      continue;
+    }
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (character === "\\") {
+      escaped = true;
+      continue;
+    }
+    if (character === '"') {
+      output += input.slice(cursor, stringStart);
+      const decoded = JSON.parse(input.slice(stringStart, index + 1));
+      output += JSON.stringify(redactText(decoded, counts));
+      stringStart = -1;
+      cursor = index + 1;
+    }
+  }
+  output += input.slice(cursor);
+  return output;
+}
+
+/**
+ * Apply the fixed common-secret rules to one complete string.
+ * @param {string} input
+ * @returns {{ value: string, counts: Record<string, number> }}
+ */
+export function redactString(input) {
+  const counts = emptyRedactionCounts();
+  if (input.length === 0) return { value: input, counts };
+  const json = redactJsonStringTokens(input, counts);
+  return { value: json ?? redactText(input, counts), counts };
 }
 
 /** @param {string} key */

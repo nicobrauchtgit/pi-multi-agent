@@ -16,6 +16,7 @@
   "include": [
     "companion/daemon.mjs",
     "companion/src/**/*.mjs",
-    "extensions/shared/redaction.mjs"
+    "extensions/shared/redaction.mjs",
+    "extensions/shared/observability/*.mjs"
   ]
 }

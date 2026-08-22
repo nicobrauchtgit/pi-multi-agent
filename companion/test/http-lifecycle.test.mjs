@@ -332,6 +332,7 @@ test("seeded credentials never appear in DB, WAL/SHM, logs, metrics, or response
     "SEEDCANARY_EEE_55555",
     "SEEDCANARY_FFF_66666",
     "ghp_abcdefghijklmnopqrstuvwxyz123456",
+    "sk-proj-ABCDEFGHIJKLMNOPQRSTUVWX",
   ];
   const seeded = event({
     kind: "future.secret.kind",
@@ -345,23 +346,37 @@ test("seeded credentials never appear in DB, WAL/SHM, logs, metrics, or response
       boundary: `${"x".repeat(70 * 1024)} ${secrets[6]}`,
     },
   });
-  const response = await ingest(daemon, [seeded]);
+  const oldSentinel = "\r\u0000redaction-json-boundary\u0000";
+  const sentinelSeeded = event({
+    eventId: "event-sentinel-bypass-corpus",
+    producer: { seq: 2 },
+    kind: "workflow.phase",
+    payload: {
+      modelLabel: `${oldSentinel}${oldSentinel}${secrets[7]}${oldSentinel}`,
+    },
+    capture: { contentMode: "metadata" },
+  });
+  const response = await ingest(daemon, [seeded, sentinelSeeded]);
   assert.equal(response.status, 200);
   for (const secret of secrets)
     assert.equal(response.text.includes(secret), false);
 
   const stored = new DatabaseSync(daemon.paths.database, { readOnly: true });
-  const row = stored
-    .prepare("SELECT payload_json, redaction_json FROM events")
-    .get();
+  const rows = stored
+    .prepare("SELECT payload_json, redaction_json FROM events ORDER BY seq")
+    .all();
   stored.close();
-  for (const secret of secrets) {
-    assert.equal(row.payload_json.includes(secret), false);
-    assert.equal(row.redaction_json.includes(secret), false);
+  for (const row of rows) {
+    for (const secret of secrets) {
+      assert.equal(row.payload_json.includes(secret), false);
+      assert.equal(row.redaction_json.includes(secret), false);
+    }
   }
   assert.ok(
-    Object.values(JSON.parse(row.redaction_json).counts).some(
-      (count) => count > 0,
+    rows.some((row) =>
+      Object.values(JSON.parse(row.redaction_json).counts).some(
+        (count) => count > 0,
+      ),
     ),
   );
 

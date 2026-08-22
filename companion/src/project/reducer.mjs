@@ -372,7 +372,3 @@ export function reduceProjection(current, event) {
   }
   return Object.freeze({ run: null, agent: null });
 }
-
-export function isProjectingKind(kind) {
-  return RUN_EVENT_KINDS.has(kind) || AGENT_EVENT_KINDS.has(kind);
-}

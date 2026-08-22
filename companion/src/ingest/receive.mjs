@@ -12,15 +12,6 @@ export class StorageError extends Error {
   }
 }
 
-function rawEventId(value) {
-  return value &&
-    typeof value === "object" &&
-    typeof value.eventId === "string" &&
-    value.eventId.length <= 200
-    ? value.eventId
-    : undefined;
-}
-
 function numericSqliteCode(error) {
   if (!error || typeof error !== "object") return undefined;
   if (Number.isInteger(error.errcode)) return error.errcode;
@@ -56,7 +47,12 @@ export function receiveBatch(db, rawEvents, nowMs, options = {}) {
   const results = new Array(rawEvents.length);
   for (let index = 0; index < rawEvents.length; index++) {
     try {
-      prepared.push({ index, event: normalizeEvent(rawEvents[index]) });
+      prepared.push({
+        index,
+        event: normalizeEvent(rawEvents[index], {
+          policyConfig: options.policyConfig,
+        }),
+      });
     } catch (error) {
       const reason =
         error && typeof error === "object" && typeof error.code === "string"
@@ -64,6 +60,9 @@ export function receiveBatch(db, rawEvents, nowMs, options = {}) {
           : "invalid-event";
       results[index] = { status: "rejected", reason };
       options.metrics?.reject(reason);
+      if (reason === "project-disabled") {
+        options.metrics?.increment("projectDisabled");
+      }
     }
   }
 
@@ -74,7 +73,6 @@ export function receiveBatch(db, rawEvents, nowMs, options = {}) {
   try {
     db.exec("BEGIN IMMEDIATE");
     transactionStarted = true;
-    let receiveOffset = 0;
     for (const item of prepared) {
       const event = item.event;
       const existingId = statements.eventById.get(event.eventId);
@@ -127,7 +125,8 @@ export function receiveBatch(db, rawEvents, nowMs, options = {}) {
         continue;
       }
 
-      const receivedAtMs = nowMs + receiveOffset++;
+      // Display-only wall clock. events.seq is the sole receive-order cursor.
+      const receivedAtMs = nowMs;
       let inserted;
       try {
         inserted = statements.insertEvent.run(
@@ -195,10 +194,20 @@ export function receiveBatch(db, rawEvents, nowMs, options = {}) {
   for (const [status, event] of deferredMetrics) {
     options.metrics?.increment(status);
     options.metrics?.addRedactions(event.redactionCounts);
-    if (event.projectIdMismatch)
+    if (event.projectIdMismatch) {
       options.metrics?.increment("projectIdMismatch");
+    }
+    if (event.policyDowngraded) {
+      options.metrics?.increment("policyDowngrades");
+    }
     if (event.truncated) options.metrics?.increment("truncations");
   }
+  // This is a current missing-sequence gauge, not a historical increment.
+  // Late/out-of-order delivery therefore closes an earlier apparent gap.
+  options.metrics?.set(
+    "producerGaps",
+    Number(statements.producerGapCount.get().value),
+  );
   options.metrics?.increment("batches");
   const currentSeq = Number(statements.maxSeq.get().value);
   return {

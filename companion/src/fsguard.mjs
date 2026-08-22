@@ -68,11 +68,19 @@ export function secureDirectory(file, options = {}) {
   try {
     const opened = fs.fstatSync(fd);
     verifyIdentity(before, opened, file);
-    if (options.tighten !== false) fs.fchmodSync(fd, DIRECTORY_MODE);
+    const tightenedMode = before.mode & 0o700;
+    if (
+      options.tighten !== false &&
+      (before.mode & MODE_MASK) !== tightenedMode
+    ) {
+      // Tightening removes group/other access but must not undo an operator's
+      // owner-write lockdown (for example changing 0500 back to 0700).
+      fs.fchmodSync(fd, tightenedMode);
+    }
     const verified = fs.fstatSync(fd);
     if (
       (verified.mode & MODE_MASK) !==
-      (options.tighten === false ? before.mode & MODE_MASK : DIRECTORY_MODE)
+      (options.tighten === false ? before.mode & MODE_MASK : tightenedMode)
     ) {
       throw new SecurityError("directory-mode-invalid", file);
     }
@@ -112,6 +120,98 @@ export function secureFile(file, options = {}) {
   return true;
 }
 
+function fileIdentity(stat) {
+  return {
+    dev: stat.dev,
+    ino: stat.ino,
+    size: stat.size,
+    mtimeMs: stat.mtimeMs,
+  };
+}
+
+function sameFileIdentity(left, right) {
+  return (
+    left.dev === right.dev &&
+    left.ino === right.ino &&
+    left.size === right.size &&
+    left.mtimeMs === right.mtimeMs
+  );
+}
+
+function openProtectedFile(file, maximum) {
+  const uid = currentUid();
+  const before = lstatOrUndefined(file);
+  if (!before) throw new SecurityError("file-missing", file);
+  if (before.isSymbolicLink())
+    throw new SecurityError("symlink-rejected", file);
+  if (!before.isFile()) throw new SecurityError("not-a-file", file);
+  if (before.uid !== uid) throw new SecurityError("wrong-owner", file);
+  if (before.size > maximum) throw new SecurityError("file-too-large", file);
+  const fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+  try {
+    const opened = fs.fstatSync(fd);
+    verifyIdentity(before, opened, file);
+    fs.fchmodSync(fd, FILE_MODE);
+    const verified = fs.fstatSync(fd);
+    if (
+      verified.uid !== uid ||
+      (verified.mode & MODE_MASK) !== FILE_MODE ||
+      verified.size > maximum
+    ) {
+      throw new SecurityError("file-security-invalid", file);
+    }
+    return { fd, identity: fileIdentity(verified) };
+  } catch (error) {
+    fs.closeSync(fd);
+    throw error;
+  }
+}
+
+export function inspectProtectedFile(file, maximum = Number.MAX_SAFE_INTEGER) {
+  const opened = openProtectedFile(file, maximum);
+  fs.closeSync(opened.fd);
+  return opened.identity;
+}
+
+/** Read one stable regular file through the descriptor that was verified. */
+export function readStableProtectedFile(file, maximum) {
+  const opened = openProtectedFile(file, maximum);
+  try {
+    const bytes = fs.readFileSync(opened.fd);
+    const after = fs.fstatSync(opened.fd);
+    if (
+      bytes.length !== opened.identity.size ||
+      !sameFileIdentity(opened.identity, fileIdentity(after))
+    ) {
+      throw new SecurityError("file-changed-during-read", file);
+    }
+    return { bytes, identity: opened.identity };
+  } finally {
+    fs.closeSync(opened.fd);
+  }
+}
+
+export function pathMatchesProtectedIdentity(file, identity) {
+  const current = lstatOrUndefined(file);
+  return Boolean(
+    current &&
+    current.isFile() &&
+    sameFileIdentity(identity, fileIdentity(current)),
+  );
+}
+
+export function unlinkProtectedFile(file, identity) {
+  if (!pathMatchesProtectedIdentity(file, identity)) return false;
+  try {
+    fs.unlinkSync(file);
+    return true;
+  } catch (error) {
+    return Boolean(
+      error && typeof error === "object" && error.code === "ENOENT",
+    );
+  }
+}
+
 /** Create and verify the protected tree without following an existing link. */
 export function ensureCompanionTree(paths) {
   const agentBefore = lstatOrUndefined(paths.agentDir);
@@ -130,13 +230,19 @@ export function ensureCompanionTree(paths) {
     rejectWritable: true,
   });
 
-  for (const directory of [paths.root, paths.spoolDir, paths.logsDir]) {
+  for (const directory of [
+    paths.root,
+    paths.spoolDir,
+    paths.quarantineDir,
+    paths.logsDir,
+  ]) {
     secureDirectory(directory, { create: true, tighten: true });
   }
-
   for (const file of [
     paths.lock,
     paths.state,
+    paths.config,
+    paths.spoolState,
     paths.ingestToken,
     paths.readToken,
     paths.metrics,

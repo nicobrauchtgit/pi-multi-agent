@@ -24,6 +24,7 @@ import type {
   TranscriptPart,
 } from "../domain.ts";
 import { SendError, SpawnError } from "../domain.ts";
+import { childProcessEnvironment } from "../../../shared/child-session.ts";
 import { codexJsonSchemaCompatibilityError } from "../../../shared/json-schema.ts";
 import { completeTextRun } from "../structured-output.ts";
 
@@ -34,6 +35,18 @@ const FORCE_KILL_AFTER_MS = 2_000;
 const PREVIEW_MAX_LENGTH = 1_024;
 /** A protocol line larger than this without a newline means a broken peer. */
 const STDOUT_BUFFER_MAX_BYTES = 4 * 1024 * 1024;
+
+/**
+ * Codex app-server exposes no trustworthy filesystem-read deny boundary in
+ * this mode. The process-wide producer therefore forces metadata-only capture;
+ * command-string matching would not make danger-full-access a security sandbox.
+ */
+export const CODEX_PROTECTED_PATH_ENFORCEMENT = Object.freeze({
+  fileTools: false,
+  shell: false,
+  richCapture: false,
+  reason: "codex-read-boundary-unavailable",
+});
 
 type JsonRecord = Record<string, unknown>;
 
@@ -373,7 +386,7 @@ const makeCodexSession = (
       try: () =>
         spawn(binary, ["app-server", "--stdio"], {
           cwd: task.cwd,
-          env: process.env,
+          env: childProcessEnvironment(),
           stdio: ["pipe", "pipe", "pipe"],
           windowsHide: true,
           // Own process group on POSIX so teardown can signal the whole

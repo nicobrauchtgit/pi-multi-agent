@@ -15,6 +15,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import {
   query,
+  type HookCallbackMatcher,
   type SDKAssistantMessage,
   type SDKMessage,
   type SDKResultMessage,
@@ -33,6 +34,11 @@ import type {
   TranscriptPart,
 } from "../domain.ts";
 import { SendError, SpawnError } from "../domain.ts";
+import {
+  childProcessEnvironment,
+  protectedPathPolicy,
+  type ProtectedPathPolicy,
+} from "../../../shared/child-session.ts";
 import {
   buildStructuredTextInstruction,
   completeTextRun,
@@ -284,6 +290,47 @@ function resultBillingUsage(result: SDKResultMessage) {
   };
 }
 
+const CLAUDE_FILE_TOOL_NAMES: Readonly<Record<string, string>> = Object.freeze({
+  Read: "read",
+  Write: "write",
+  Edit: "edit",
+  MultiEdit: "edit",
+  Glob: "glob",
+  Grep: "grep",
+  LS: "ls",
+  NotebookEdit: "write",
+});
+
+/** SDK PreToolUse denial remains effective under bypassPermissions. */
+export function claudeProtectedPathHooks(
+  cwd: string,
+  policy: ProtectedPathPolicy = protectedPathPolicy(),
+): { PreToolUse: HookCallbackMatcher[] } {
+  return {
+    PreToolUse: [
+      {
+        hooks: [
+          async (input) => {
+            if (input.hook_event_name !== "PreToolUse") return {};
+            const tool = CLAUDE_FILE_TOOL_NAMES[input.tool_name];
+            if (!tool || !policy.decide(tool, input.tool_input, cwd).denied) {
+              return {};
+            }
+            return {
+              hookSpecificOutput: {
+                hookEventName: "PreToolUse" as const,
+                permissionDecision: "deny" as const,
+                permissionDecisionReason:
+                  "Protected parent observability state is unavailable to child tools.",
+              },
+            };
+          },
+        ],
+      },
+    ],
+  };
+}
+
 export function claudeStructuredOptions(schema: unknown | undefined) {
   return {
     systemPrompt: {
@@ -391,6 +438,8 @@ const makeClaudeSession = (
               : { settingSources: ["user" as const] }),
             includePartialMessages: true,
             abortController,
+            env: childProcessEnvironment(),
+            hooks: claudeProtectedPathHooks(task.cwd),
             ...(resumeSessionId ? { resume: resumeSessionId } : {}),
             ...(claudeBinary
               ? { pathToClaudeCodeExecutable: claudeBinary }

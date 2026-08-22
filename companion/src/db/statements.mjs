@@ -6,6 +6,21 @@ export function createStatements(db) {
     eventByProducer: db.prepare(
       "SELECT seq, event_id, producer_id, producer_seq, payload_sha256 FROM events WHERE producer_id = ? AND producer_seq = ?",
     ),
+    maxProducerSeq: db.prepare(
+      "SELECT COALESCE(MAX(producer_seq), 0) AS value FROM events WHERE producer_id = ?",
+    ),
+    producerGapCount: db.prepare(`
+      SELECT COALESCE(SUM(
+        CASE WHEN max_seq > positive_count THEN max_seq - positive_count ELSE 0 END
+      ), 0) AS value
+      FROM (
+        SELECT
+          MAX(producer_seq) AS max_seq,
+          SUM(CASE WHEN producer_seq >= 1 THEN 1 ELSE 0 END) AS positive_count
+        FROM events
+        GROUP BY producer_id
+      )
+    `),
     insertEvent: db.prepare(`
       INSERT INTO events (
         event_id, envelope_version, event_kind, schema_version,

@@ -9,7 +9,10 @@ import {
   SettingsManager,
   type AgentSession,
   type SessionShutdownEvent,
+  type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
+import { observabilityPaths } from "./observability/home.mjs";
+import { canonicalizePath, pathContains } from "./observability/policy.mjs";
 
 const CHILD_SHUTDOWN_TIMEOUT_MS = 5_000;
 const CHILD_EXTENSION_SCOPE_KEY = Symbol.for(
@@ -250,4 +253,324 @@ export function shutdownAndDisposeChildSession(
 
   childShutdowns.set(session, shutdown);
   return shutdown;
+}
+
+const CHILD_PROTECTED_PATH_CONFIG_KEY = Symbol.for(
+  "pi-multi-agent.child-protected-path-config.v1",
+);
+
+interface ChildProtectedPathConfig {
+  readonly agentDir: string;
+  readonly moshiPaths: readonly string[];
+  readonly additionalRoots: readonly string[];
+}
+
+function childProtectedPathConfig(): ChildProtectedPathConfig {
+  const root = globalThis as typeof globalThis & {
+    [CHILD_PROTECTED_PATH_CONFIG_KEY]?: ChildProtectedPathConfig;
+  };
+  return (
+    root[CHILD_PROTECTED_PATH_CONFIG_KEY] ?? {
+      agentDir: getAgentDir(),
+      moshiPaths: [],
+      additionalRoots: [],
+    }
+  );
+}
+
+/** Parent-owned process configuration; values are never put in child prompts/env. */
+export function configureChildProtectedPaths(config: ChildProtectedPathConfig) {
+  if (isChildExtensionLoad()) {
+    throw new Error(
+      "Child extension loading cannot reconfigure protected paths.",
+    );
+  }
+  const root = globalThis as typeof globalThis & {
+    [CHILD_PROTECTED_PATH_CONFIG_KEY]?: ChildProtectedPathConfig;
+  };
+  root[CHILD_PROTECTED_PATH_CONFIG_KEY] = Object.freeze({
+    agentDir: config.agentDir,
+    moshiPaths: Object.freeze([...config.moshiPaths]),
+    additionalRoots: Object.freeze([...config.additionalRoots]),
+  });
+}
+
+export interface ProtectedPathDecision {
+  readonly denied: boolean;
+  readonly reason?: "protected-target" | "protected-search-root" | "unresolved";
+}
+
+export interface ProtectedPathPolicy {
+  readonly roots: readonly string[];
+  decide(toolName: string, input: unknown, cwd: string): ProtectedPathDecision;
+  isProtected(candidate: string, cwd?: string): boolean;
+}
+
+const FILE_TOOL_NAMES = new Set([
+  "read",
+  "write",
+  "edit",
+  "grep",
+  "find",
+  "ls",
+  "glob",
+  "search",
+  "apply_patch",
+  "patch",
+]);
+const SEARCH_TOOL_NAMES = new Set(["grep", "find", "ls", "glob", "search"]);
+const PATH_KEYS = new Set([
+  "path",
+  "file",
+  "filepath",
+  "file_path",
+  "filename",
+  "notebook_path",
+  "paths",
+  "directory",
+  "cwd",
+  "root",
+  "include",
+]);
+const SEARCH_ROOT_KEYS = new Set(["path", "directory", "cwd", "root"]);
+const SEARCH_GLOB_KEYS = new Set(["glob"]);
+
+function globPrefix(value: string) {
+  const index = value.search(/[?*[]/);
+  if (index < 0) return value;
+  const prefix = value.slice(0, index);
+  const slash = Math.max(prefix.lastIndexOf("/"), prefix.lastIndexOf(path.sep));
+  return slash < 0 ? "." : prefix.slice(0, slash + 1);
+}
+
+function strings(value: unknown): string[] {
+  if (typeof value === "string") return [value];
+  if (!Array.isArray(value)) return [];
+  return value.filter((entry): entry is string => typeof entry === "string");
+}
+
+function keyedPathCandidates(
+  value: unknown,
+  keys: ReadonlySet<string>,
+  depth = 0,
+): string[] {
+  if (depth > 8 || !value || typeof value !== "object") return [];
+  if (Array.isArray(value)) {
+    return value
+      .flatMap((entry) => keyedPathCandidates(entry, keys, depth + 1))
+      .slice(0, 256);
+  }
+  const output: string[] = [];
+  for (const [key, child] of Object.entries(
+    value as Record<string, unknown>,
+  ).slice(0, 256)) {
+    if (keys.has(key.toLowerCase())) output.push(...strings(child));
+    else if (child && typeof child === "object") {
+      output.push(...keyedPathCandidates(child, keys, depth + 1));
+    }
+    if (output.length >= 256) break;
+  }
+  return output.slice(0, 256);
+}
+
+function searchPatternCandidates(toolName: string, input: unknown) {
+  const keys = new Set(SEARCH_GLOB_KEYS);
+  // Pi/Claude find/glob patterns are filesystem globs. Grep's `pattern` is
+  // content and must not be interpreted as a path, while grep.glob is a path.
+  if (["find", "glob", "search"].includes(toolName)) keys.add("pattern");
+  return keyedPathCandidates(input, keys);
+}
+
+/** Canonical protected inventory shared by standalone/workflow/resumed children. */
+export function protectedPathPolicy(
+  options: {
+    agentDir?: string;
+    moshiPaths?: readonly string[];
+    additionalRoots?: readonly string[];
+  } = {},
+): ProtectedPathPolicy {
+  const configured = childProtectedPathConfig();
+  const paths = observabilityPaths(options.agentDir ?? configured.agentDir);
+  const candidates = [
+    paths.root,
+    paths.rolesDir,
+    paths.workflowsDir,
+    paths.runArtifactsDir,
+    paths.exportDir,
+    ...(options.moshiPaths ?? configured.moshiPaths),
+    ...(options.additionalRoots ?? configured.additionalRoots),
+  ];
+  const roots = Object.freeze(
+    [...new Set(candidates.map((entry) => canonicalizePath(entry)))].sort(),
+  );
+
+  const isProtected = (candidate: string, cwd = process.cwd()) => {
+    try {
+      const canonical = canonicalizePath(candidate.replace(/^@/, ""), cwd);
+      return roots.some((root) => pathContains(root, canonical));
+    } catch {
+      return true;
+    }
+  };
+
+  return Object.freeze({
+    roots,
+    isProtected,
+    decide(toolName: string, input: unknown, cwd: string) {
+      const normalizedTool = toolName.toLowerCase();
+      if (!FILE_TOOL_NAMES.has(normalizedTool)) {
+        return { denied: false } as const;
+      }
+      const search = SEARCH_TOOL_NAMES.has(normalizedTool);
+      const explicitRoots = search
+        ? keyedPathCandidates(input, SEARCH_ROOT_KEYS)
+        : [];
+      const candidates: Array<{
+        raw: string;
+        base: string;
+        searchRoot: boolean;
+      }> = [];
+      if (search) {
+        const searchRoots = explicitRoots.length > 0 ? explicitRoots : [cwd];
+        for (const raw of searchRoots)
+          candidates.push({ raw, base: cwd, searchRoot: true });
+        for (const raw of searchPatternCandidates(normalizedTool, input)) {
+          for (const base of searchRoots) {
+            candidates.push({ raw, base, searchRoot: false });
+          }
+        }
+      } else {
+        for (const raw of keyedPathCandidates(input, PATH_KEYS)) {
+          candidates.push({ raw, base: cwd, searchRoot: false });
+        }
+      }
+
+      for (const candidate of candidates.slice(0, 256)) {
+        let canonical: string;
+        try {
+          const base =
+            search && !candidate.searchRoot
+              ? canonicalizePath(candidate.base.replace(/^@/, ""), cwd)
+              : candidate.base;
+          canonical = canonicalizePath(
+            globPrefix(candidate.raw.replace(/^@/, "")),
+            base,
+          );
+        } catch {
+          return { denied: true, reason: "unresolved" } as const;
+        }
+        if (roots.some((root) => pathContains(root, canonical))) {
+          return { denied: true, reason: "protected-target" } as const;
+        }
+        if (
+          (candidate.searchRoot || search) &&
+          roots.some((root) => pathContains(canonical, root))
+        ) {
+          return {
+            denied: true,
+            reason: "protected-search-root",
+          } as const;
+        }
+      }
+      return { denied: false } as const;
+    },
+  });
+}
+
+/** Reject child cwd values inside or above any protected parent tree. */
+export function assertChildWorkingDirectoryAllowed(
+  candidate: string,
+  policy: ProtectedPathPolicy = protectedPathPolicy(),
+) {
+  const canonical = canonicalizePath(candidate);
+  if (
+    policy.roots.some(
+      (root) => pathContains(root, canonical) || pathContains(canonical, root),
+    )
+  ) {
+    throw new ProtectedPathAccessError("working_dir");
+  }
+  return canonical;
+}
+
+export class ProtectedPathAccessError extends Error {
+  constructor(toolName: string) {
+    super(
+      `Tool call "${toolName}" cannot access protected parent observability state.`,
+    );
+    this.name = "ProtectedPathAccessError";
+  }
+}
+
+interface ChildToolRegistry {
+  getAllTools(): Array<{ name: string }>;
+  getToolDefinition(name: string): ToolDefinition | undefined;
+}
+
+/** Enforce supported Pi file/search tools at their actual execute boundary. */
+export function createProtectedPathToolGuard(policy: ProtectedPathPolicy) {
+  const wrapped = new WeakSet<ToolDefinition>();
+  const wrap = (definition: ToolDefinition) => {
+    if (wrapped.has(definition)) return;
+    wrapped.add(definition);
+    const execute = definition.execute;
+    definition.execute = async (toolCallId, params, signal, onUpdate, ctx) => {
+      const cwd =
+        ctx &&
+        typeof ctx === "object" &&
+        "cwd" in ctx &&
+        typeof ctx.cwd === "string"
+          ? ctx.cwd
+          : process.cwd();
+      if (policy.decide(definition.name, params, cwd).denied) {
+        throw new ProtectedPathAccessError(definition.name);
+      }
+      return execute.call(
+        definition,
+        toolCallId,
+        params,
+        signal,
+        onUpdate,
+        ctx,
+      );
+    };
+  };
+  return Object.freeze({
+    apply(session: ChildToolRegistry) {
+      for (const { name } of session.getAllTools()) {
+        const definition = session.getToolDefinition(name);
+        if (definition) wrap(definition);
+      }
+    },
+  });
+}
+
+/** Honest release gate: no backend currently has a proven shell boundary. */
+export const CHILD_BACKEND_PATH_CAPABILITIES = Object.freeze({
+  pi: Object.freeze({ fileTools: true, shell: false, richCapture: false }),
+  claude: Object.freeze({ fileTools: true, shell: false, richCapture: false }),
+  codex: Object.freeze({ fileTools: false, shell: false, richCapture: false }),
+});
+
+/** Remove observability-only controls before any external child/grandchild. */
+export function childProcessEnvironment(
+  source: NodeJS.ProcessEnv = process.env,
+): NodeJS.ProcessEnv {
+  return Object.fromEntries(
+    Object.entries(source).filter(
+      ([key]) => !key.startsWith("PI_OBSERVABILITY_"),
+    ),
+  );
+}
+
+export function processRichCaptureAllowed(
+  enabledBackends: readonly (keyof typeof CHILD_BACKEND_PATH_CAPABILITIES)[] = [
+    "pi",
+    "claude",
+    "codex",
+  ],
+) {
+  return enabledBackends.every(
+    (backend) => CHILD_BACKEND_PATH_CAPABILITIES[backend].richCapture,
+  );
 }

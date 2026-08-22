@@ -3,6 +3,7 @@ import {
   codexJsonSchemaCompatibilityError,
   jsonSchemaValidationError,
 } from "../shared/json-schema.ts";
+import { assertChildWorkingDirectoryAllowed } from "../shared/child-session.ts";
 import { ensureBlackboard, withBlackboard } from "../shared/hunk-blackboard.ts";
 import { truncateUtf8 } from "../shared/text.ts";
 import type { ProcessServiceHandle } from "../shared/service-registry.ts";
@@ -372,6 +373,7 @@ export async function executeManagerWorkflowAgent(
       registry: context.parent.modelRegistry,
     });
     validateSchema(options.schema, harness);
+    assertChildWorkingDirectoryAllowed(context.cwd);
   } catch (error) {
     return failedResult(
       context,

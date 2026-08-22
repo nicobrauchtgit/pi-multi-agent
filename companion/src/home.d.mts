@@ -1,18 +1,8 @@
-export function resolveAgentDir(configured?: string): string;
-export function companionHome(agentDir?: string): string;
-export function homePaths(agentDir?: string): Readonly<{
-  agentDir: string;
-  multiAgentDir: string;
-  root: string;
-  spoolDir: string;
-  logsDir: string;
-  lock: string;
-  state: string;
-  ingestToken: string;
-  readToken: string;
-  metrics: string;
-  database: string;
-  wal: string;
-  shm: string;
-  log: string;
-}>;
+export {
+  companionHome,
+  resolveAgentDir,
+} from "../../extensions/shared/observability/home.mjs";
+export type { ObservabilityPaths } from "../../extensions/shared/observability/home.mjs";
+export function homePaths(
+  agentDir?: string,
+): import("../../extensions/shared/observability/home.mjs").ObservabilityPaths;

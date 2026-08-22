@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import test from "node:test";
@@ -129,7 +129,10 @@ test("workflow tool acquires the process service and persists manager-backed wor
     path.join(tmpdir(), "pi-workflow-extension-integration-"),
   );
   const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
-  process.env.PI_CODING_AGENT_DIR = directory;
+  const agentDir = path.join(directory, "agent");
+  const project = path.join(directory, "project");
+  await Promise.all([mkdir(agentDir), mkdir(project)]);
+  process.env.PI_CODING_AGENT_DIR = agentDir;
   resetProcessServiceRegistryForTests();
   const sink = createRecordingSink();
   const runtime = ManagedRuntime.make(
@@ -147,7 +150,7 @@ test("workflow tool acquires the process service and persists manager-backed wor
     sink,
   });
   const harness = extensionHarness();
-  const ctx = context(directory);
+  const ctx = context(project);
   try {
     await emit(harness, "session_start", ctx);
     const updates: WorkflowDetails[] = [];
@@ -178,7 +181,7 @@ test("workflow tool acquires the process service and persists manager-backed wor
       true,
     );
 
-    const runDir = path.join(directory, "workflows", details.runId);
+    const runDir = path.join(agentDir, "workflows", details.runId);
     assert.equal(existsSync(path.join(runDir, "workflow.json")), true);
     const artifact = JSON.parse(
       await readFile(path.join(runDir, "workflow.json"), "utf8"),

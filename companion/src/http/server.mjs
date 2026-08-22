@@ -99,9 +99,6 @@ export async function startHttpServer(options) {
 
   return Object.freeze({
     port,
-    get inFlight() {
-      return inFlight;
-    },
     async close() {
       if (stopping) return;
       stopping = true;

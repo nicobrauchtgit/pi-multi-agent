@@ -47,6 +47,38 @@ test("marker-bearing matches redact real secrets without breaking idempotency", 
   assert.ok(once.counts.credentialUrl > 0);
 });
 
+test("JSON token boundaries are out-of-band and cannot peel attacker sentinels", () => {
+  const oldSentinel = "\r\u0000redaction-json-boundary\u0000";
+  const secret = "sk-proj-ABCDEFGHIJKLMNOPQRSTUVWX";
+  const fixtures = [
+    `${oldSentinel}${secret}${oldSentinel}`,
+    JSON.stringify({
+      modelLabel: `${oldSentinel}${oldSentinel}${secret}${oldSentinel}`,
+    }),
+    JSON.stringify(
+      JSON.stringify(`${oldSentinel}${oldSentinel}${secret}${oldSentinel}`),
+    ),
+  ];
+  for (const fixture of fixtures) {
+    let current = fixture;
+    for (let pass = 0; pass < 6; pass++) {
+      current = redactString(current).value;
+      assert.equal(
+        current.includes(secret),
+        false,
+        `secret survived fixture ${fixtures.indexOf(fixture)} pass ${pass}`,
+      );
+    }
+  }
+});
+
+test("netrc-style whitespace assignments are redacted", () => {
+  const source = "machine example.test login user password mypassword123";
+  const redacted = redactString(source);
+  assert.equal(redacted.value.includes("mypassword123"), false);
+  assert.match(redacted.value, /password \[REDACTED:secret-field\]/);
+});
+
 test("secret-named JSON fields replace their complete subtree", () => {
   const secrets = ["SEEDCANARY_ARRAY_11111", "SEEDCANARY_OBJECT_22222"];
   const once = redactJson({
@@ -63,6 +95,38 @@ test("secret-named JSON fields replace their complete subtree", () => {
   const twice = redactJson(once.value);
   assert.equal(JSON.stringify(twice.value), stored);
   assert.equal(twice.counts.secretField, 0);
+});
+
+test("common authorization and token key variants suppress values", () => {
+  const secret = "Basic U0VFRENBTkFSWV9LRVlfVkFSSUFOVF8xMTExMQ==";
+  const keys = [
+    "proxy-authorization",
+    "x-api-key",
+    "x-auth-token",
+    "accessToken",
+    "refresh_token",
+    "id-token",
+    "session_token",
+    "auth_token",
+    "bearer",
+    "credential",
+    "credentials",
+  ];
+  const source = Object.fromEntries(
+    keys.map((key, index) => [
+      key,
+      index % 3 === 0 ? [secret] : index % 3 === 1 ? { raw: secret } : secret,
+    ]),
+  );
+  const redacted = redactJson(source);
+  const stored = JSON.stringify(redacted.value);
+  assert.equal(stored.includes(secret), false);
+  for (const key of keys) {
+    assert.equal(
+      (redacted.value as Record<string, unknown>)[key],
+      REDACTION_MARKERS.secretField,
+    );
+  }
 });
 
 test("companion contains no copied redaction implementation", async () => {
@@ -89,7 +153,7 @@ test("companion contains no copied redaction implementation", async () => {
   }
 });
 
-test("D1 stays disconnected from Pi extension production code", async () => {
+test("production extensions never import bare companion internals", async () => {
   const { readdir, readFile } = await import("node:fs/promises");
   const { resolve } = await import("node:path");
   const root = resolve(import.meta.dirname, "..");

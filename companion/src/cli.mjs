@@ -64,13 +64,24 @@ function ensureExistingTree(paths) {
   ensureCompanionTree(paths);
 }
 
+async function reuseStartingDaemon(paths, budgetMs = 3_000) {
+  const deadline = Date.now() + budgetMs;
+  do {
+    if (await reuseRunningDaemon(paths)) return true;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  } while (Date.now() < deadline);
+  return false;
+}
+
 async function start(paths, options) {
   ensureCompanionTree(paths);
   let lock;
   try {
     lock = acquireDaemonLock(paths);
   } catch (error) {
-    if (error instanceof LockHeldError && (await reuseRunningDaemon(paths))) {
+    // The winner owns the lock before daemon.json and rotated tokens exist.
+    // Wait for that bounded cold-start window rather than racing to exit 72.
+    if (error instanceof LockHeldError && (await reuseStartingDaemon(paths))) {
       output({ ok: true, code: "reused" });
       return;
     }

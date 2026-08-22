@@ -1,7 +1,7 @@
 # Observability architecture
 
-_Status: accepted staged plan; C0, C1, and D1 implemented; D2-D5 not started_
-_Last updated: 2026-08-23_
+_Status: accepted staged plan; C0, C1, D1, and D2 implemented; D3-D5 not started_
+_Last updated: 2026-08-24_
 
 This document is the canonical plan for local observability in Pi Multi-Agent. It is specific enough to implement, but it deliberately avoids building the final analytics platform before the first useful slice has been dogfooded.
 
@@ -13,7 +13,7 @@ The first useful release must:
 - use Pi hooks and the unified `SubagentManager` event boundary as the primary source of truth;
 - survive daemon downtime and producer restarts without blocking orchestration;
 - recover or enrich missing facts idempotently from repository-owned artifacts;
-- keep rich local prompts, messages, tool data, results, and structured output within explicit byte bounds;
+- keep only bounded redacted prompt, assistant, and tool excerpts in SQLite; complete code, results, transcripts, patches, and diffs remain in protected artifacts or the VCS and are represented by metadata/references;
 - redact common secrets before any observability-owned disk write and re-redact every payload in the daemon;
 - provide a read-only local web UI with a small HTTP API and cursor polling;
 - support per-project disable/content-exclusion policy, bounded retention, purge, and export;
@@ -37,7 +37,7 @@ The following are explicitly deferred:
 - web mutation/control endpoints;
 - a model-visible observability tool.
 
-Polling is sufficient until measured UI use shows otherwise. Bounded content remains inline in SQLite until database-size evidence justifies another tier.
+Polling is sufficient until measured UI use shows otherwise. SQLite keeps bounded excerpts and index metadata, never complete generated code or complete agent artifacts. Protected files and the VCS are the content backing stores when recovery or code retrieval is required.
 
 ## 3. Accepted decisions and invariants
 
@@ -94,7 +94,7 @@ The plan relies on current repository behavior rather than a hypothetical rewrit
                      (workflow/shared artifacts and role metadata)
 ```
 
-There is no broker and no frontend build/runtime server. The D1 daemon is a no-build, bare-Node ESM companion under `companion/` (`.mjs`, Node built-ins only); Pi extensions do not import it. Security-critical redaction is the single dependency-free `extensions/shared/redaction.mjs` implementation imported by bare Node now and by the D2 producer later. The daemon runtime floor is Node 22.5.0, the first Node 22 release with `node:sqlite`; startup also probes that the built-in is constructible and performs at most one guarded `--experimental-sqlite` re-exec for early flag-gated releases. On an older/incompatible runtime, it exits with machine-readable unavailable code 69 before touching the companion home; generic software failure remains code 70. It never falls back to another SQLite package, and orchestration remains unaffected.
+There is no broker and no frontend build/runtime server. The daemon remains a no-build, bare-Node ESM companion under `companion/` (`.mjs`, Node built-ins only); Pi production code does not import companion modules. Producer and daemon import the same dependency-free `extensions/shared/redaction.mjs` and `extensions/shared/observability/normalize.mjs` pipeline. The daemon runtime floor is Node 22.5.0, the first Node 22 release with `node:sqlite`; startup also probes that the built-in is constructible and performs at most one guarded `--experimental-sqlite` re-exec for early flag-gated releases. On an older/incompatible runtime, it exits with machine-readable unavailable code 69 before touching the companion home; generic software failure remains code 70. It never falls back to another SQLite package. The D2 producer remains in bounded spool mode and orchestration is unaffected.
 
 ## 6. Identity model
 
@@ -165,7 +165,7 @@ Rules:
 - Unknown event kinds are accepted only after generic shape/size validation and recursive daemon redaction. They are stored but do not update known projections.
 - `producer.seq` is monotonically increasing within one `producerId`. It detects gaps and conflicts; it is not the global query cursor.
 - `occurredAt` is optional display/provenance data. It never decides which projection value wins.
-- The daemon supplies `received_at_ms` and `events.seq`.
+- The daemon supplies `received_at_ms` and `events.seq`. `received_at_ms` is one plain `Date.now()` batch stamp: it may repeat or move with wall-clock adjustment and is display-only. It is never made artificially monotonic and never orders data; `events.seq` is the sole receive cursor/order.
 - Every string/key, nesting depth, collection length, event size, and batch size has a hard ingress limit. Request or non-content-envelope violations reject the event; recognized content-field overflow follows the truncation rules in §7.3 instead of rejecting the whole event.
 
 ### 7.2 V1 event ownership
@@ -178,30 +178,30 @@ Rules:
 | Reconciler                                                    | `artifact.observed`, `artifact.recovered`                                                                                                                       | Deterministic IDs, source marked `artifact`; fills gaps but does not overwrite primary facts.                                                                                 |
 | Producer/daemon                                               | `telemetry.dropped`, `telemetry.spool_overflow`, `telemetry.rejected`                                                                                           | Contains counts/reasons only, never rejected payload bytes.                                                                                                                   |
 
-Streaming assistant deltas and repeated tool-progress updates are not durable v1 facts. `message.assistant` stores only a finalized parent assistant message; its payload may include separately bounded finalized thinking content when the hook exposes it safely. The sink may coalesce deltas for a live summary, but it persists finalized parent and agent messages, tool results, and lifecycle boundaries. This keeps the event log useful without turning token streaming into most of the database.
+Streaming assistant deltas and repeated tool-progress updates are not durable v1 facts. `message.assistant` may store a bounded redacted excerpt of the finalized parent response and separately bounded thinking excerpt when the hook exposes them safely. Agent messages and tool events likewise store only excerpts plus metadata, never complete results or transcripts. The sink may coalesce deltas for a live summary while preserving lifecycle boundaries.
 
 ### 7.3 Payload policy
 
-V1 keeps content inline. Stored-field caps are measured as the UTF-8 byte length of the final JSON-encoded field value, so JSON escaping is charged to the field rather than hidden as envelope overhead.
+V1 permits bounded excerpts inline. The following are hard normalization ceilings, not targets and not permission to copy a complete artifact into SQLite. Stored-field caps are measured as the UTF-8 byte length of the final JSON-encoded excerpt, so JSON escaping is charged to the field rather than hidden as envelope overhead.
 
-| Content                                  |         Stored cap |
-| ---------------------------------------- | -----------------: |
-| prompt or user message                   |             64 KiB |
-| assistant/thinking message               |            128 KiB |
-| tool arguments                           |             64 KiB |
-| tool result                              |            128 KiB |
-| structured result                        |            256 KiB |
-| patch/diff when later enabled            |            256 KiB |
-| all content fields in one event          |            256 KiB |
-| reserved non-content envelope + metadata |            128 KiB |
-| one stored event                         |            512 KiB |
-| one ingest batch                         | 2 MiB / 128 events |
+| Content                                  |                 Stored cap |
+| ---------------------------------------- | -------------------------: |
+| prompt or user message                   |                     64 KiB |
+| assistant/thinking message               |                    128 KiB |
+| tool arguments                           |                     64 KiB |
+| tool result                              |                    128 KiB |
+| structured-result preview                |                    256 KiB |
+| patch/diff                               | not inline; reference only |
+| all content fields in one event          |                    256 KiB |
+| reserved non-content envelope + metadata |                    128 KiB |
+| one stored event                         |                    512 KiB |
+| one ingest batch                         |         2 MiB / 128 events |
 
 The 512 KiB event cap is strictly larger than the 256 KiB aggregate content budget plus the 128 KiB envelope allowance. The remaining 128 KiB is safety headroom, not another content budget. IDs, project data, capture/redaction metadata, field names, and JSON container syntax count against the envelope allowance.
 
 Overflow of an individual content field or the aggregate content budget is handled by deterministic UTF-8-safe field truncation/omission, not whole-event rejection. The event records original byte count when known, stored byte count, affected field paths, and `truncated: true`; producer-declared truncation provenance is retained separately from any daemon-side truncation so an already-truncated capture is never reported as complete. No original tail is retained. Only a request-level limit or a non-content envelope that cannot fit its allowance/event cap after content is truncated causes rejection without persistence.
 
-Current `SubagentEvent` tool fields are UI previews, not a recoverable rich payload. D2 must not parse or inflate those previews. Backend mappings may attach a separate optional capture value when the native event exposes arguments/results; the producer bounds and redacts it before disk while the existing snapshot preview behavior remains unchanged. If a backend does not expose a value safely, the event records `contentUnavailable` rather than guessing. Finalized message content already available at the manager boundary follows the same bounds. This provides rich capture where evidence exists without relying on racy child-extension hooks.
+Current `SubagentEvent` tool fields are UI previews, not recoverable payloads. D2 must not parse or inflate them. A backend may provide a separately bounded excerpt only when the native event exposes it safely; complete arguments/results remain outside SQLite. If no safe excerpt exists, the event records `contentUnavailable` rather than guessing. Complete structured results and generated code use protected artifact or VCS references in D4/D5.
 
 ## 8. Producer sink, batching, and replay
 
@@ -226,9 +226,9 @@ The sink is called alongside, not inside, existing manager and workflow folds. A
 - Flush: every 100 ms, at 64 events, or at 512 KiB.
 - Coalesce latest usage/meta/tool-progress update per entity while queued.
 - Do not coalesce creation, run/turn start, finalized message, tool completion, error, phase/log, or settlement events.
-- On pressure, discard coalescable progress first. If a durable event cannot be queued, move it to the spool worker and increment a gap counter.
+- On pressure, discard coalescable progress first. If a durable event cannot be queued, move it and every older queued durable event to the spool in producer order; any true missing sequence appears in the daemon's current gap gauge.
 
-The exact numbers are configuration constants and must be exercised under load before being made user-facing settings.
+D2 implements these constants. Normal spool work is asynchronous. At the exceptional hard queue limit, the producer synchronously writes the older bounded queue followed by the new already-redacted durable event to immutable segment(s), rather than placing the newest event in an earlier segment or growing memory without bound. Failure is swallowed and reduced to a safe count. This pressure-only disk path is intentionally documented because `emit()` remains non-throwing but cannot be described as allocation-only under exhaustion.
 
 ### 8.3 Protected spool
 
@@ -238,6 +238,7 @@ Spool records are already redacted and bounded event envelopes. Raw producer pay
 ~/.pi/agent/multi-agent/observability/
   spool/
     <producer-id>/
+      state.json          # producer-local ACK watermarks/counters
       00000001.ndjson
       00000002.ndjson
 ```
@@ -249,8 +250,8 @@ Defaults:
 - directories `0700`, files `0600`;
 - each batch is written to a temporary file, closed, and atomically renamed to an immutable `.ndjson` segment; replay never reads a file still being written;
 - complete lines from an abandoned temporary file may be promoted after the file is unchanged across the conservative stale-write window; a partial crash tail is discarded and counted;
-- malformed redacted segments are quarantined within the same cap and never logged verbatim;
-- when the hard cap is exhausted, evict coalescable records/segments first, then the oldest segment, and persist only dropped counts in a small protected state file.
+- malformed/version-skewed records are isolated and counted per line; valid records in the same and later segments continue replay, and unknown bytes are never logged verbatim;
+- when the hard cap is exhausted, evict coalescable records/segments first, then the oldest segment, and persist only dropped counts in a small protected producer-local state file.
 
 Spool ownership is shared recovery work, not lifetime ownership by the `producerId` that created a directory. On daemon startup and periodically while idle, the daemon scans every producer directory and feeds immutable segments through the same validation, redaction, transaction, and projection path as HTTP ingest. On producer startup/reconnect, the one sink selected by the process-wide shared module guard also scans **all** producer directories, including foreign/dead producer IDs, and replays backlog before sending newer live events. Replay preserves filename order within each producer; ties across producers may use a deterministic directory order because daemon receive sequence remains authoritative.
 
@@ -264,9 +265,9 @@ Delivery is at least once. `eventId` is reused unchanged by every replayer.
 
 ### 9.1 Pi-side owner
 
-Since C1, `extensions/subagents/index.ts` is the sole Pi-side owner of the manager and sink and will own the future `ensureDaemon()` call. The workflow extension lazily consumes a versioned process-service handle but never creates a manager/sink or starts/stops a daemon independently. If workflows are loaded without the subagents service, the extension still loads for diagnostics, but workflow execution fails clearly rather than reviving a private runner.
+`extensions/subagents/index.ts` is the sole Pi-side owner of the manager, D2 producer sink, daemon controller, and lazy `ensureDaemon()` call. The workflow extension lazily consumes the same versioned process-service sink and never creates a producer/manager or starts/stops a daemon independently. If workflows are loaded without the subagents service, the extension still loads for diagnostics, but workflow execution fails clearly rather than reviving a private runner.
 
-The service boundary uses a `Symbol.for(...)` `globalThis` registry rather than a module singleton because Pi evaluates shared modules separately per extension with jiti module caching disabled. One live owner token and epoch guard manager/runtime/sink identity; reload, session replacement, and shutdown invalidate the handle and abort consumers before bounded manager/runtime cleanup. Child resource reload and binding run inside a global `AsyncLocalStorage` scope, while exact-realpath filters cover both PackageManager's scoped settings inputs and the final loaded extension set. The scope also denies provide/acquire defensively. Future D2 producer guarding and bounded spool flush attach to this existing owner; C1 itself still uses the no-op sink and adds no daemon or spool.
+The service boundary and producer each use `Symbol.for(...)` `globalThis` guards because Pi evaluates shared modules separately per extension with jiti module caching disabled. One live owner token and epoch guard manager/runtime/sink identity; reload, session replacement, and shutdown invalidate consumers, settle manager work, spool queued redacted records, and return within a bounded flush budget. The shared daemon is deliberately left running for other Pi processes. Child resource reload and binding retain the global `AsyncLocalStorage` and exact-realpath extension filters, and child loads cannot provide/acquire a process service or create a second producer.
 
 ### 9.2 Companion home
 
@@ -277,11 +278,14 @@ The service boundary uses a `Symbol.for(...)` `globalThis` registry rather than 
   ingest.token                              0600
   read.token                                0600
   daemon-metrics.json                       0600
+  config.json                               0600
+  spool-state.json                          0600  (legacy reserved path; no concurrent writers)
   observability.sqlite3                     0600
   observability.sqlite3-wal                 0600
   observability.sqlite3-shm                 0600
   reconcile-state.json                      0600  (created by D4, not D1)
-  spool/                                    0700  (empty in D1)
+  spool/                                    0700
+    quarantine/                             0700  (safe reason/count metadata only)
   logs/                                     0700
 ```
 
@@ -289,7 +293,7 @@ The service boundary uses a `Symbol.for(...)` `globalThis` registry rather than 
 
 At every startup the daemon:
 
-1. uses `lstat`, rejects symlinks, verifies the current UID owns every existing component, and tightens/verifies directory mode `0700` and file mode `0600`;
+1. uses `lstat`, rejects symlinks, verifies the current UID owns every existing component, removes group/other directory access without restoring owner write permission from a stricter `0500` lockdown, and tightens/verifies writable protected files as `0600`;
 2. acquires an exclusive create lock using the repository's dead-PID recovery pattern;
 3. starts/migrates SQLite and verifies the DB, WAL, and SHM modes after SQLite creates them;
 4. binds only `127.0.0.1` on an ephemeral port;
@@ -451,7 +455,7 @@ One standalone redaction implementation is imported by both producer and daemon.
 - **Producer:** redacts before spool and before any new observability-owned artifact write.
 - **Daemon:** treats the producer as untrusted and recursively re-redacts every accepted event, including unknown kinds and artifact imports.
 
-No request body, rejected event, secret match, or SQL parameter is written to logs. Redaction telemetry contains only coarse rule class and count, not matched values or exact secret lengths.
+No request body, rejected event, secret match, or SQL parameter is written to logs. Redaction telemetry contains only coarse rule class and count, not matched values or exact secret lengths. Valid JSON text is scanned by decoding each string token behind out-of-band parser state; no payload-forgeable sentinel is inserted and removed after the final scan.
 
 ### 11.2 Required processing order
 
@@ -473,12 +477,12 @@ There is no “scan first MiB, store two MiB” mode and no unscanned tail. Reda
 The initial fixed, reviewed rule set covers at least:
 
 - authorization/bearer and cookie headers;
-- password/secret/token/API-key/private-key fields in JSON, env, and common CLI output;
+- password/secret/token/API-key/private-key fields in JSON, env, common CLI output, and `.netrc`-style whitespace assignments;
 - PEM private-key blocks;
 - common GitHub, AWS, npm, Slack, and similar recognizable token forms;
 - credentials embedded in URLs/connection strings.
 
-Rules must be linear or otherwise demonstrably bounded. User-supplied regex is not part of v1. Arbitrarily encoded/encrypted secrets cannot be reliably recognized; path suppression and purge are therefore required rather than overstating scanner guarantees.
+Rules must be linear or otherwise demonstrably bounded. User-supplied regex is not part of v1. Arbitrarily encoded/encrypted secrets and fullwidth/confusable spellings cannot be reliably recognized; path suppression and metadata-only capture are therefore required rather than overstating scanner guarantees.
 
 ### 11.4 Secret-path policy
 
@@ -490,7 +494,7 @@ The policy applies to **reads, tool arguments/results, messages, structured resu
 - if content originates from an excluded path, store operation, path classification, byte counts, and omission reason only—never content or a content hash;
 - daemon reconciliation resolves paths beneath configured roots, rejects traversal/symlink escape, and reapplies the same policy;
 - messages/results without reliable path provenance still receive generic secret scanning;
-- a bash command that accesses a protected observability path is blocked by child policy, not merely redacted afterward.
+- supported Pi/Claude file-tool access to a protected path is blocked by child policy; shell/Codex access is not claimed secure and therefore keeps production capture metadata-only.
 
 ### 11.5 Child deny-path integration
 
@@ -510,9 +514,9 @@ Requirements:
 4. never pass token values or companion paths in a child prompt, environment variable, result, or native resume record;
 5. test direct path, symlink, glob/search, and shell access for every enabled backend.
 
-If a backend cannot enforce the protected path for its normal file and shell tools, rich observability must remain disabled for that backend or the unsafe tool must be unavailable. The system must not silently rely on `0600` against a child running as the same OS user.
+D2 enforces supported Pi file/search tools by wrapping their actual tool definitions and uses Claude SDK `PreToolUse` denial for its file/search tools, including under `bypassPermissions`. Decisions cover explicit path keys, grep/find glob fields, implicit search cwd, symlink/parent traversal, and child working directories inside or above protected roots. Codex has no trustworthy read boundary in the current app-server mode, and shell execution on all three backends cannot be secured by inspecting command text. Because the store is shared, D2 therefore applies the stricter process-wide result: production rich capture is forced to metadata-only rather than merely disabled for one backend. Unsafe tools were not removed because that would change orchestration behavior.
 
-This boundary protects against model actions through supported child tools. It does not claim to isolate arbitrary malicious native code already running as the user's UID.
+The file-tool checks are defense in depth against model actions through supported tools; they are not an OS sandbox and do not claim to isolate arbitrary malicious native code already running as the user's UID. Such code can also forge/delete spool segments or flood quarantine, not merely read tokens. `0600` and command-string matching are explicitly not treated as same-UID confidentiality or integrity isolation.
 
 ### 11.6 HTTP and browser security
 
@@ -530,7 +534,7 @@ This boundary protects against model actions through supported child tools. It d
 
 ### 12.1 Routes
 
-D1 exposes only `/healthz` and `/v1/ingest`; every data-read/static route below remains absent until D3.
+D2 still exposes only `/healthz` and `/v1/ingest`; every data-read/static route below remains absent until D3.
 
 Internal write route:
 
@@ -561,7 +565,7 @@ The static no-build UI has four views:
 
 1. **Runs:** project/status/kind filters; start time, duration, phase, agent counts, failure, redaction/truncation badges.
 2. **Run timeline:** workflow phases/logs, parent turns, agent lanes, tool durations, usage/meta changes, artifact-recovery markers.
-3. **Agent detail:** role/backend/model/native locator metadata, turns, bounded messages, tool calls/results, structured result preview, queue/failure history.
+3. **Agent detail:** role/backend/model/native locator metadata, turns, bounded message/tool excerpts, structured-result metadata/preview and artifact reference, queue/failure history.
 4. **System health:** daemon/build/schema, DB/WAL/spool size, oldest retained time/sequence, dropped/conflicting events, redaction counts, disabled/metadata-only projects.
 
 Diffs are absent until their attribution label is honest. Every content panel distinguishes `redacted`, `omitted by path policy`, `truncated`, and `unavailable`.
@@ -574,9 +578,11 @@ Artifacts remain useful for crash recovery but are not a second event vocabulary
 
 D4 handles repository-owned, bounded formats first:
 
-- existing workflow `workflow.json`, `result.json`, and `transcripts.json`;
-- new shared redacted run artifacts produced after C1;
+- existing workflow `workflow.json`, `result.json`, and `transcripts.json` as reconciliation inputs;
+- new protected, redacted run artifacts produced after C1 and retained outside SQLite;
 - role records for metadata/native-session linkage.
+
+SQLite stores artifact identity, kind, path/reference, hash, size, redaction/truncation state, and bounded preview/recovery metadata. It does not copy a complete result, transcript, generated source file, patch, or diff.
 
 Native Pi/Claude/Codex session-file harvesting is deferred. In particular, v1 does not build separate Claude/Codex tailers. A future optional Moshi projection importer is governed separately by §21 and is not a v1 source.
 
@@ -587,9 +593,9 @@ The reconciler:
 - scans only allowlisted roots and filenames;
 - uses `lstat`, rejects symlink traversal, and enforces file/count/total-byte limits;
 - parses with bounded serialization rules;
-- applies secret-path policy and the full daemon redaction pipeline;
+- applies secret-path policy and the full daemon redaction pipeline before deriving any preview or metadata;
 - creates deterministic `eventId = sha256("artifact-v1\0" + sourceKind + "\0" + canonicalPath + "\0" + storedContentHash)`;
-- marks provenance and recovery confidence in `payload`;
+- stores only provenance, reference/hash/size, bounded preview, and recovery confidence in `payload`;
 - never mutates the source artifact.
 
 A small protected `reconcile-state.json` records canonical source identity, last processed fingerprint, and an `imported`, `skipped-policy`, or `purged` decision—never source content. A repeated scan of an unchanged fingerprint inserts nothing even if retention has removed its old event. A changed checkpoint creates a new observation event only if it is still within current project/retention policy. The state file is bounded by source count and drops entries only after the source has been absent beyond retention. This avoids an importer table while preventing old artifacts from being re-imported after retention or purge.
@@ -614,7 +620,7 @@ Record cwd/project, tool name, known canonical paths, and content-policy metadat
 
 ### Stage 1 — post-dogfood shared change summary
 
-At manager run boundaries, optionally capture bounded pre/post changed-file metadata for the run's project: path, status, size, and non-secret hash. If agents overlap in the same worktree, label the result `shared/unattributed`. Excluded paths have no content hash.
+At manager run boundaries, optionally capture bounded pre/post changed-file metadata for the run's project: VCS repository/revision/blob references when available, path, status, size, and non-secret hash. High-level symbol or AST metadata may be included only when existing language/VCS tooling exposes it without adding a speculative parser subsystem. Source lines and diffs remain in the VCS rather than SQLite. If agents overlap in the same worktree, label the result `shared/unattributed`; excluded paths have no content hash.
 
 This may be D5 only after the D1-D4 timeline is useful and storage data is available.
 
@@ -632,17 +638,21 @@ Exact claiming of Pi child-extension hook events is likewise deferred until a no
 
 ### 15.1 Project policy
 
-A protected daemon configuration supports longest-root matching:
+A protected daemon configuration supports a producer rollback switch, autostart, and longest-root matching:
 
 ```json
 {
+  "version": 1,
+  "capture": "metadata",
+  "autostart": true,
   "defaults": {
     "enabled": true,
-    "contentMode": "rich",
+    "contentMode": "metadata",
     "retentionDays": 30,
     "maxDatabaseBytes": 1073741824,
     "maxSpoolBytes": 67108864
   },
+  "moshiPaths": [],
   "projects": [
     { "root": "/path/to/no-capture", "enabled": false },
     { "root": "/path/to/metadata-only", "contentMode": "metadata" },
@@ -653,13 +663,15 @@ A protected daemon configuration supports longest-root matching:
 
 - `disabled`: the producer drops project events before disk and daemon rejects them if received.
 - `metadata`: lifecycle/timing/status/path classifications are retained, but prompt/message/args/result/patch/structured content is omitted.
-- `rich`: bounded and redacted content is retained.
+- `rich`: bounded and redacted content would be retained only when the process-wide child boundary self-assessment permits it.
 
-The parent determines policy before capture; the daemon independently enforces it. Runtime policy changes affect new events. Purge removes old data.
+D2 defaults both top-level capture and project content to `metadata`. Missing project attribution fails closed to metadata (or disabled when capture/default policy is disabled). Because shell tools on Pi/Claude and filesystem reads in the current Codex `danger-full-access` mode cannot reliably deny same-UID observability paths, both the production producer and daemon independently narrow every explicit rich selection to metadata process-wide. This is deliberate: the shared SQLite store cannot safely be rich for one backend while another backend can read or forge it. Pi file/search execution wrappers and Claude `PreToolUse` still provide defense in depth, but neither command-string matching nor `0600` is claimed as a shell sandbox. Policy-free normalization can exercise rich mode in isolated tests; production does not opt in until every enabled backend passes the boundary gate or unsafe tools are removed at a real backend boundary.
+
+The parent determines policy before capture; the daemon canonicalizes again and independently enforces it. Runtime daemon policy changes affect newly ingested/replayed events. `capture: "off"` is the one-switch D2 rollback: no producer, autostart, or spool records are created, while manager/workflow orchestration remains the C1 path. Purge remains D4.
 
 ### 15.2 Retention and size pressure
 
-Defaults are 30 days and 1 GiB for DB + WAL, plus a separate 64 MiB spool cap. Retention runs at startup and periodically:
+D2 validates and exposes the 30-day and 1 GiB DB/WAL defaults but deliberately does not implement retention, purge, or export; those remain D4. D2 does enforce the separate 64 MiB spool cap. In D4, retention will run at startup and periodically:
 
 1. never prune an active run;
 2. delete the oldest settled run groups and their events/agents in bounded transactions until both age and size targets are met;
@@ -712,7 +724,7 @@ The authenticated read API streams already-redacted JSONL. A CLI wrapper may wri
 ### 17.1 Contract and reducer tests
 
 - Envelope v1 accepts additive fields and safely stores unknown kinds.
-- Maximum-size structured/patch fields fit with the reserved envelope allowance; field overflow truncates without dropping the event, while envelope overflow rejects it.
+- Maximum-size structured-result previews fit with the reserved envelope allowance; field overflow truncates without dropping the event, while envelope overflow rejects it. Patch/diff events retain references and metadata only—never inline patch bytes.
 - Finalized parent assistant/thinking content is represented by `message.assistant`; streaming deltas are not persisted.
 - Identity is minted before backend spawn and remains stable through follow-up/resume.
 - Workflow-owned agent events are emitted only by manager, never by the workflow run reducer.
@@ -859,29 +871,30 @@ Acceptance result:
 
 - deterministic temp-home and subprocess tests cover runtime probe/refusal, permissions/symlinks/modes/temp cleanup, compare-checked lock reclaim, token separation, HTTP Host/idle gates, migration fresh/repeat/failure/newer refusal, complete golden schema, WAL SIGKILL recovery, injected event/projection rollback, complete-event duplicates/conflicts, numeric SQLite failures, skew, incomplete rows, terminal restart, rebuild equality/drift, recursive marker-safe redaction/truncation, marker-density bounds, and seeded leak scans across DB/sidecars/logs/counters/responses;
 - no Pi hook, sink connection, autostart, spool/replay implementation, project capture integration, child path-policy change, read API/UI, artifact/retention/export/importer, extra application table, external blob/dependency, or model-visible surface was added;
-- the C0 production sink remains no-op/disconnected, so orchestration has no daemon dependency.
+- at the D1 checkpoint, the C0 production sink remained no-op/disconnected, so orchestration had no daemon dependency.
 
 Rollback: stop the opt-in daemon and remove only an explicitly selected D1 test companion home/database. Runtime orchestration remains unchanged because the production sink is still no-op and no extension imports `companion/`.
 
 ### D2 — Pi hooks, manager sink, autostart, and protected spool
 
-Implement:
+Status: completed 2026-08-24.
 
-- root Pi lifecycle/tool/message hooks;
-- manager and workflow-run sink taps;
-- producer redaction/bounds, batching/coalescing, protected spool, replay;
-- subagents-owned autostart and bounded shutdown flush;
-- per-project disable/metadata/rich policy;
-- child protected-path integration and mode/ownership verification.
+Implemented:
 
-Acceptance gate:
+- one `Symbol.for(...)`-guarded producer sink created only by the subagents process-service owner; manager and workflow-run events use that same sink, while child extension loads cannot create one;
+- root Pi session/run, user prompt, finalized assistant/thinking, turn, tool, compaction, model/context/usage, and shutdown taps; no streaming message/tool deltas, provider payloads, or second agent lifecycle vocabulary;
+- shared producer/daemon redact → fixed per-field and 256 KiB aggregate bounds → complete second scan, applied synchronously before the 512-event/4 MiB queue and before every spool byte;
+- 100 ms / 64-event / 512 KiB batching, usage/meta coalescing, safe reason/count diagnostics, exact loopback Host/token discovery, bounded retries, and a current producer-sequence gap gauge that closes when late records fill a hole;
+- protected immutable NDJSON segments (8 MiB each, 64 MiB total), fsync + atomic finalize, producer-local ACK/counter state, complete-line stale-temp recovery, per-record malformed/version isolation, payload-free quarantine metadata, cap/GC, replay-before-live, and foreign/dead-producer adoption by both daemon and producer;
+- lazy authenticated daemon health/autostart once per process service, bounded concurrent cold-start reuse (including the former lock-before-state exit-72 race), permanent exit-69 spool mode, and bounded shutdown/reload spooling without stopping the shared daemon;
+- protected `config.json` with top-level `off|metadata|rich`, autostart, safe storage/retention defaults, canonical longest-root project entries, exclusions, and Moshi paths; missing attribution fails closed, the daemon independently rejects disabled projects, and both producer and daemon cap D2 rich configuration to metadata;
+- plain wall-clock `received_at_ms` batch stamps; daemon `events.seq` remains the only ordering/cursor authority;
+- canonical protected paths for the complete observability inventory, roles, existing workflows, future run artifacts, export root, and configured Moshi state/socket roots; Pi file/search execution and Claude `PreToolUse` deny explicit/implicit cwd and tool-specific glob vectors, while manager admission rejects child cwd values inside or above protected roots;
+- an honest global metadata-only production fallback because same-UID shell access and Codex reads are not enforceable today. Explicit rich configuration is narrowed rather than advertised as secure.
 
-- daemon outage does not affect agents/workflows;
-- replay is idempotent and receive ordered;
-- cross-backend child deny-path tests pass or rich capture remains disabled for the failing backend;
-- the redaction leak evaluation passes for live ingest and spool.
+Acceptance evidence includes shared normalization/static-import tests, policy/longest-root tests, producer queue/coalescing/spool/replay/shutdown tests, parent-hook mapping/fault isolation, Pi/Claude/Codex capability/path tests, temp-daemon cold-start and exit-69 subprocess tests, daemon policy/spool adoption/wall-clock tests, and leak scans over live DB/sidecars/logs/metrics/responses plus producer spool. D2 adds no read/static route, artifact rewrite/reconciliation, retention/purge/export implementation, diff capture, importer, fourth application table, or model-visible API.
 
-Rollback: one local configuration switch disables capture/autostart and leaves manager/workflow behavior intact. It must not re-enable the legacy workflow runner.
+Rollback: set protected `config.json` top-level `"capture": "off"`. The service uses the no-op sink, does not autostart or write spool records, leaves manager/workflow behavior intact, and never revives the deleted legacy runner.
 
 ### D3 — read API, polling UI, and dogfood entry
 
@@ -904,8 +917,8 @@ Rollback: stop serving static/read routes while ingestion/storage continues, or 
 
 Implement:
 
-- shared redacted run/result/transcript artifacts for standalone and workflow-owned agents;
-- durable structured results, closing `TASK-D-001`;
+- protected redacted run/result/transcript artifacts for standalone and workflow-owned agents, retained outside SQLite with DB references/metadata;
+- durable structured-result artifacts outside SQLite, closing `TASK-D-001`;
 - idempotent bounded workflow/shared artifact reconciliation and role enrichment;
 - age/size retention, metadata-only pressure mode, offline purge, and redacted export.
 

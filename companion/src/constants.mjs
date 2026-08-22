@@ -1,6 +1,8 @@
+import { OBSERVABILITY_LIMITS } from "../../extensions/shared/observability/normalize.mjs";
+
 export const PROTOCOL_VERSION = 1;
 export const SCHEMA_VERSION = 1;
-export const BUILD_VERSION = "0.1.0-d1";
+export const BUILD_VERSION = "0.2.0-d2";
 
 export const EXIT = Object.freeze({
   OK: 0,
@@ -14,23 +16,6 @@ export const EXIT = Object.freeze({
 });
 
 export const LIMITS = Object.freeze({
-  batchBytes: 2 * 1024 * 1024,
-  batchEvents: 128,
-  storedEventBytes: 512 * 1024,
-  envelopeBytes: 128 * 1024,
-  contentBytes: 256 * 1024,
-  promptBytes: 64 * 1024,
-  assistantBytes: 128 * 1024,
-  toolArgumentsBytes: 64 * 1024,
-  toolResultBytes: 128 * 1024,
-  structuredBytes: 256 * 1024,
-  metadataStringBytes: 4 * 1024,
-  eventIdBytes: 200,
-  kindBytes: 200,
-  keyBytes: 256,
-  depth: 32,
-  nodes: 20_000,
-  objectKeys: 256,
-  arrayItems: 4_096,
+  ...OBSERVABILITY_LIMITS,
   inflightRequests: 16,
 });

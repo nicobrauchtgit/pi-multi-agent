@@ -8,7 +8,12 @@ import test from "node:test";
 import { openDatabase, checkpointAndClose } from "../src/db/open.mjs";
 import { userVersion } from "../src/db/migrate.mjs";
 import { SCHEMA_V1_SQL } from "../src/db/schema-v1.mjs";
-import { ensureCompanionTree, verifyDatabaseFiles } from "../src/fsguard.mjs";
+import {
+  ensureCompanionTree,
+  readStableProtectedFile,
+  unlinkProtectedFile,
+  verifyDatabaseFiles,
+} from "../src/fsguard.mjs";
 import { homePaths } from "../src/home.mjs";
 import { acquireDaemonLock, LockHeldError } from "../src/lock.mjs";
 import { assertGoldenSchema, quickCheckDatabase } from "../src/maintenance.mjs";
@@ -37,6 +42,16 @@ test("protected home rejects symlinks and writable ancestors", (t) => {
   );
 });
 
+test("directory tightening preserves an operator owner-write lockdown", (t) => {
+  const agentDir = tempAgentDir(t);
+  const paths = homePaths(agentDir);
+  ensureCompanionTree(paths);
+  fs.chmodSync(paths.root, 0o500);
+  ensureCompanionTree(paths);
+  assertMode(paths.root, 0o500);
+  fs.chmodSync(paths.root, 0o700);
+});
+
 test("protected files and SQLite sidecars are tightened to 0600", (t) => {
   const agentDir = tempAgentDir(t);
   const paths = homePaths(agentDir);
@@ -54,6 +69,21 @@ test("protected files and SQLite sidecars are tightened to 0600", (t) => {
   if (fs.existsSync(paths.wal)) assertMode(paths.wal, 0o600);
   if (fs.existsSync(paths.shm)) assertMode(paths.shm, 0o600);
   checkpointAndClose(opened.db);
+});
+
+test("stable companion reads never delete a replacement path", (t) => {
+  const agentDir = tempAgentDir(t);
+  const paths = homePaths(agentDir);
+  ensureCompanionTree(paths);
+  const file = path.join(paths.spoolDir, "stable-read-test");
+  const moved = `${file}.moved`;
+  fs.writeFileSync(file, "original\n", { mode: 0o600 });
+  const stable = readStableProtectedFile(file, 1024);
+  fs.renameSync(file, moved);
+  fs.writeFileSync(file, "replacement\n", { mode: 0o600 });
+  assert.equal(unlinkProtectedFile(file, stable.identity), false);
+  assert.equal(fs.readFileSync(file, "utf8"), "replacement\n");
+  assert.equal(stable.bytes.toString("utf8"), "original\n");
 });
 
 test("concurrent cold-start tree creation is race-safe", async (t) => {

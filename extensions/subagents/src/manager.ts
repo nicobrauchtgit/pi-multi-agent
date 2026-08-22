@@ -70,6 +70,7 @@ import {
 } from "../../shared/json-schema.ts";
 import { truncateUtf8 } from "../../shared/text.ts";
 import { boundWorkflowOwnership } from "../../shared/workflow-metadata.ts";
+import { assertChildWorkingDirectoryAllowed } from "../../shared/child-session.ts";
 
 export const MAX_RUNNING = 4;
 export const MAX_TRACKED = 64;
@@ -938,6 +939,16 @@ const makeManager = Effect.gen(function* () {
             return rejectBeforeReservation(
               new ConcurrencyLimitError({
                 message: `Max ${MAX_RUNNING} subagents can run concurrently. Wait for one to finish before spawning another.`,
+              }),
+            );
+          }
+
+          try {
+            assertChildWorkingDirectoryAllowed(normalizedTask.cwd);
+          } catch (error) {
+            return rejectBeforeReservation(
+              new SpawnError({
+                message: error instanceof Error ? error.message : String(error),
               }),
             );
           }

@@ -63,6 +63,7 @@ export function createRoutes(options) {
       const result = receiveBatch(options.db, events, now, {
         statements: options.statements,
         metrics: options.metrics,
+        policyConfig: options.config?.current(),
       });
       options.health.degraded = false;
       options.metrics.flush();

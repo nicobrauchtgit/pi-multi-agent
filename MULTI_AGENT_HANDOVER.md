@@ -1,6 +1,6 @@
 # Multi-Agent Setup — Handover
 
-_Last updated: 2026-08-23_
+_Last updated: 2026-08-24_
 
 This is the current handover for the Pi multi-agent repository under:
 
@@ -491,7 +491,7 @@ Implemented and verified:
 
 C0 adds no daemon, database, persistence, redaction implementation,
 model-visible API, child-hook claim map, or second agent lifecycle vocabulary.
-The production sink remains no-op until the later staged producer/storage work.
+At the C0 checkpoint, the production sink remained no-op pending the later staged producer/storage work.
 
 ---
 
@@ -576,24 +576,62 @@ Implemented as a standalone bare-Node ESM companion under `companion/`:
 D1 deliberately does **not** connect the C0 sink or Pi hooks, autostart from an
 extension, implement spool/replay or child protected paths, expose read/UI
 routes, reconcile artifacts, retain/purge/export data, or change any
-model-visible surface. Production capture therefore remains no-op until D2.
+model-visible surface. Production capture remained no-op at the D1 checkpoint; D2 below now connects it.
 
 Rollback: stop the opt-in daemon and remove only an explicitly selected D1 test
 companion home/database. No extension imports `companion/`, so orchestration is
 unchanged.
 
-#### D2 — Pi/manager ingestion, protected spool, and autostart
+#### D2 — Pi/manager ingestion, protected spool, and autostart — completed 2026-08-24
 
-- parent Pi hooks plus unified manager events are primary;
-- workflow events remain run-level start/phase/log/settle only;
-- producer redaction, batching, bounded spool/replay, and per-project
-  disable/metadata/rich policy;
-- subagents owns one guarded `ensureDaemon()` lifecycle; workflows never start a
-  second daemon;
-- enforce child deny paths for daemon tokens, DB/WAL/SHM, spool, config,
-  existing workflow artifacts, and new run artifacts; verify `0700` directories
-  and `0600` files;
-- redact, then bound/truncate, then re-scan; store no unscanned bytes.
+Implemented and verified:
+
+- `extensions/subagents/index.ts` now owns one process-wide guarded producer,
+  daemon controller, runtime, and manager; workflows consume the same sink and
+  child/duplicate extension loads cannot create another producer;
+- root Pi session/run, prompt, finalized assistant/thinking, turn, tool,
+  compaction, model/context/usage, and shutdown facts flow beside existing
+  manager and workflow-run events; deltas/provider payloads remain uncaptured
+  and manager remains sole owner of `agent.*` lifecycle;
+- producer and daemon literally share out-of-band JSON-token redaction →
+  UTF-8-safe field/aggregate bound → complete second-scan normalization.
+  Normalization runs before the bounded memory queue and every immutable spool
+  byte; failures retain reason/counts only and there is no emergency payload
+  file;
+- the producer batches at 100 ms / 64 events / 512 KiB inside a 512-event / 4
+  MiB queue, coalesces usage/meta, uses bounded loopback HTTP/token discovery
+  and deterministic retry, and spools durable pressure/shutdown records;
+- protected 8 MiB NDJSON segments use fsync + atomic rename, 64 MiB aggregate
+  cap, producer-local ACK/counter state, complete-line stale-temp recovery,
+  per-record malformed/version isolation, payload-free quarantine metadata,
+  ordered idempotent adoption/replay by producer and daemon, and empty-directory
+  GC;
+- authenticated lazy autostart coalesces concurrent callers, waits through the
+  lock-before-state cold-start race, treats runtime exit 69 as permanent spool
+  mode, and leaves the shared daemon running on bounded reload/shutdown flush;
+- protected `config.json` supports top-level `capture: off|metadata|rich`,
+  autostart, canonical longest-root project enabled/content policy,
+  `excludePaths`, storage/retention defaults, and `moshiPaths`; missing project
+  attribution fails closed, and producer plus daemon independently cap D2 rich
+  configuration to metadata;
+- `received_at_ms` is now a plain display-only wall-clock batch stamp. SQLite
+  `events.seq` remains the sole order/cursor and the three-table D1 schema is
+  unchanged;
+- canonical child protection covers the companion root and every token/DB/WAL/
+  SHM/state/lock/spool/config/log/export child, roles, workflow artifacts,
+  future run artifacts, and configured Moshi roots. Pi file/search tools are
+  wrapped at execution, Claude uses `PreToolUse` denial, implicit cwd and
+  grep/find glob vectors are covered, and unsafe child working directories are
+  rejected before backend spawn;
+- rich production capture is intentionally forced to metadata-only because
+  shell access and Codex filesystem reads do not have a reliable same-UID
+  isolation boundary. `0600` and command-string matching are not claimed as
+  security. This is a process-wide fallback because all backends share one DB.
+
+Rollback: set `~/.pi/agent/multi-agent/observability/config.json` top-level
+`"capture": "off"`, then restart/reload Pi. The service uses the no-op sink,
+performs no autostart or spool-record writes, and keeps the C1 manager/workflow
+path unchanged. It never restores the deleted legacy runner.
 
 #### D3 — Read-only API and polling web UI
 
@@ -604,7 +642,7 @@ unchanged.
 
 #### D4 — Shared redacted artifacts and reconciliation
 
-Create a shared redacted run artifact layout for:
+Create a protected redacted run artifact layout outside SQLite for:
 
 - structured outputs;
 - final reports;
@@ -613,9 +651,12 @@ Create a shared redacted run artifact layout for:
 - role records pointing to latest artifacts.
 
 Persist these for standalone and workflow-owned manager agents, closing
-`TASK-D-001`. Reconcile existing bounded workflow/shared artifacts
-idempotently as recovery/enrichment without overriding primary hook/manager
-facts. Add age/DB/spool caps, offline purge, and redacted export.
+`TASK-D-001`. SQLite stores only artifact references, hashes, sizes,
+redaction/truncation state, and bounded previews/recovery metadata; it never
+copies complete code, results, transcripts, patches, or diffs. Reconcile
+existing bounded workflow/shared artifacts idempotently as recovery/enrichment
+without overriding primary hook/manager facts. Add age/DB/spool caps, offline
+purge, and redacted export.
 
 Never expose the companion home to a child. If an agent must receive an output
 artifact path, use a separate agent-owned path inside its cwd/configured
@@ -625,10 +666,13 @@ same bounds/redaction pipeline.
 #### D5 — Dogfood and honest change summaries
 
 Tune caps/indexes from measured local use before normalizing more tables.
-Optionally add bounded changed-file summaries only after the timeline is useful;
-shared-worktree results must be labelled `shared/unattributed`. Exact child-hook
-or diff attribution requires a later non-racy API or worktree/atomic-patch
-isolation and is not a v1 claim.
+Optionally add bounded changed-file summaries only after the timeline is useful.
+Use VCS repository/revision/blob/path references as the content backing where
+available; keep source lines and diffs out of SQLite. Include high-level symbol
+or AST metadata only when existing tooling exposes it without a speculative
+parser subsystem. Shared-worktree results must be labelled
+`shared/unattributed`. Exact child-hook or diff attribution requires a later
+non-racy API or worktree/atomic-patch isolation and is not a v1 claim.
 
 Task D acceptance includes the redaction leak evaluation, child deny-path tests,
 projection replay/rebuild tests, daemon-outage tests, retention/purge/export,
@@ -734,9 +778,17 @@ Rollback would involve moving current `extensions/{subagents,workflows,shared}` 
 - Manager-backed workflow transcripts intentionally contain bounded UI previews,
   not the deleted runner's fuller tool payloads; rich redacted transcripts and
   oversized explicit result preservation remain Task D (see `BUGS.md`).
-- The D1 observability database/daemon exists only as an opt-in disconnected
-  companion. Pi hook/manager production, spool/autostart/path policy, and durable
-  shared standalone/workflow artifacts remain D2/D4.
+- D2 production observability is connected and defaults to metadata-only. The
+  daemon may be absent without affecting orchestration because the producer
+  uses the protected bounded spool. Read/UI remains D3; shared redacted
+  standalone/workflow artifacts, reconciliation, retention, purge, and export
+  remain D4.
+- Rich capture is not currently available in production even if configured:
+  shell tools and Codex reads cannot enforce a same-UID protected-path boundary,
+  so producer and daemon narrow the shared store process-wide to metadata.
+  Pi/Claude file-tool denial is defense in depth, not an OS sandbox; unrestricted
+  same-UID code can also forge/delete/flood spool state. Unicode-confusable
+  secret spellings remain outside the fixed ASCII scanner (see `BUGS.md`).
 - Structured standalone results are live snapshot/tool data only; durable run
   artifacts and Hunk result summaries remain D4.
 - Hunk blackboard is ephemeral and requires repo/diff context.
@@ -822,3 +874,17 @@ Completed on 2026-08-23:
      compare-checked stale-lock reclaim, and exact golden-schema verification;
    - deterministic storage/security/fault/subprocess acceptance coverage with no
      D2-D5 producer, read/UI, artifact, or model-surface scope.
+
+Completed on 2026-08-24:
+
+1. Task D2 producer, hooks, spool, policy, and autostart:
+   - one subagents-owned process producer shared by manager/workflows and root Pi hooks;
+   - shared producer/daemon redaction and content/envelope budgets before queue/disk;
+   - bounded coalescing queue, protected immutable spool, adoption/replay/ACK/GC;
+   - authenticated lazy daemon autostart, concurrent cold-start reuse, bounded shutdown;
+   - independent protected longest-root daemon policy and `capture: "off"` rollback;
+   - canonical Pi/Claude file-tool protected paths plus honest process-wide
+     metadata fallback for unenforceable shell/Codex same-UID access;
+   - wall-clock `received_at_ms` drift fix with daemon `seq` as sole order;
+   - deterministic unit/subprocess/live-temp-daemon coverage without D3-D5 or
+     model-visible surface.

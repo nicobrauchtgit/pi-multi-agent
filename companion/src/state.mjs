@@ -6,6 +6,8 @@ import { assertNoSymlink, secureFile } from "./fsguard.mjs";
 const ATOMIC_STATE_FILES = new Set([
   "daemon.json",
   "daemon-metrics.json",
+  "config.json",
+  "spool-state.json",
   "ingest.token",
   "read.token",
 ]);
