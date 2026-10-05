@@ -27,13 +27,13 @@ Source: `/Users/davis/.pi/agent/extensions/subagents/` (`index.ts`, `manager.ts`
 
 ### 1.1 Tools exposed to the parent LLM
 
-| Tool              | Parameters                                                                    | Behavior                                                                                                                                                                                                                                                                                                                           |
-| ----------------- | ----------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `subagent_spawn`  | `prompt`, `title`, `working_dir?`, `model?`, `provider?`, `reasoning_effort?` | Fire-and-forget spawn. Returns immediately with an id (`sa-N`). Enforces `MAX_RUNNING = 4` with a synchronous reservation so parallel tool calls can't race past the cap. Validates `working_dir`, resolves model against the registry (inherit parent model/thinking level by default), truncates title to 160 chars.             |
-| `subagent_wait`   | `ids[]` (max 64)                                                              | Blocks until all listed subagents settle; respects the tool `AbortSignal`; streams `Waiting for ...` via `onUpdate`. Marks the awaited results "consumed" so they are not also auto-delivered. Output budgets: 48KB total, 16KB per agent, with per-section fallbacks (`[omitted: ...]`). Errors on unknown ids (lists known ids). |
-| `subagent_cancel` | `ids[]`                                                                       | Aborts running subagents (marks consumed first to avoid duplicate delivery), waits for settlement, reports per-id `Cancelled ...` / `was already <status>`. Partial transcripts remain on disk.                                                                                                                                    |
-| `subagent_check`  | `id`                                                                          | Non-blocking peek: status line, turn count, error text, up to 2KB/20 lines of latest output (includes the live streaming assistant message). Does not consume the result.                                                                                                                                                          |
-| `subagent_list`   | —                                                                             | One `describeSubagent()` line per agent: `id [status] "title" (provider/model, ctx%, elapsed, cwd)`.                                                                                                                                                                                                                               |
+| Tool              | Parameters                                                       | Behavior                                                                                                                                                                                                                                                                                                                           |
+| ----------------- | ---------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `subagent_spawn`  | `prompt`, `title`, `working_dir?`, `model?`, `reasoning_effort?` | Fire-and-forget spawn. Returns immediately with an id (`sa-N`). Enforces `MAX_RUNNING = 4` with a synchronous reservation so parallel tool calls can't race past the cap. Validates `working_dir`, resolves model against the registry (inherit parent model/thinking level by default), truncates title to 160 chars.             |
+| `subagent_wait`   | `ids[]` (max 64)                                                 | Blocks until all listed subagents settle; respects the tool `AbortSignal`; streams `Waiting for ...` via `onUpdate`. Marks the awaited results "consumed" so they are not also auto-delivered. Output budgets: 48KB total, 16KB per agent, with per-section fallbacks (`[omitted: ...]`). Errors on unknown ids (lists known ids). |
+| `subagent_cancel` | `ids[]`                                                          | Aborts running subagents (marks consumed first to avoid duplicate delivery), waits for settlement, reports per-id `Cancelled ...` / `was already <status>`. Partial transcripts remain on disk.                                                                                                                                    |
+| `subagent_check`  | `id`                                                             | Non-blocking peek: status line, turn count, error text, up to 2KB/20 lines of latest output (includes the live streaming assistant message). Does not consume the result.                                                                                                                                                          |
+| `subagent_list`   | —                                                                | One `describeSubagent()` line per agent: `id [status] "title" (provider/model, ctx%, elapsed, cwd)`.                                                                                                                                                                                                                               |
 
 Prompt metadata (all strings live in `prompt.ts`): `subagent_spawn` has a
 `promptSnippet` and two `promptGuidelines` (delegate self-contained tasks; don't block on
@@ -456,7 +456,7 @@ onUpdate, ctx)` builds one `Effect.gen` program and runs it with
   (model registry, cwd, trust) are captured into the program as plain values/callbacks.
 - **Tool schema change:** `subagent_spawn` gains
   `agent: StringEnum(["pi", "claude", "codex"])` (optional, default `"pi"`), and
-  `model`/`provider`/`reasoning_effort` keep their v1 shapes but are documented as
+  `model`/`reasoning_effort` keep their v1 shapes but are documented as
   backend-interpreted (pi validates against the registry; claude/codex validate against
   their own known-model rules — stubs accept anything). `describeSubagent` lines and the
   dashboard gain the backend name (e.g. `sa-3 [running] "title" (codex, gpt-5-codex,
@@ -561,7 +561,7 @@ Recommendation: (a) during development, rename to final names when v2 replaces v
 
 ## 6. Open questions (need user input)
 
-1. **Per-backend spawn options.** v1's `model`/`provider`/`reasoning_effort` are
+1. **Per-backend spawn options.** v1's `model`/`reasoning_effort` are
    pi-shaped. Options: (a) keep one generic `model` string + `reasoning_effort` that
    each backend interprets (proposed above — simplest for the LLM); (b) add a
    `backend_options` free-form object; (c) per-backend defaults in a config file with no

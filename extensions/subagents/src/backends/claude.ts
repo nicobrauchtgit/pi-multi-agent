@@ -148,7 +148,7 @@ class ClaudeInput implements AsyncIterable<SDKUserMessage> {
 // --- Model, effort, and transcript helpers ----------------------------------
 
 /**
- * Claude's deprecated-but-supported maxThinkingTokens is the closest match to
+ * Claude's maxThinkingTokens is the closest match to
  * the shared numeric scale requested by this extension. Zero explicitly
  * disables extended thinking in SDK 0.3.207; an omitted effort leaves the CLI
  * default untouched.
@@ -321,7 +321,7 @@ export function claudeProtectedPathHooks(
                 hookEventName: "PreToolUse" as const,
                 permissionDecision: "deny" as const,
                 permissionDecisionReason:
-                  "Protected parent observability state is unavailable to child tools.",
+                  "Protected parent orchestration state is unavailable to child tools.",
               },
             };
           },

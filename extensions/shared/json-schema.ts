@@ -446,7 +446,7 @@ export function jsonSchemaToTypebox(schema: unknown): TSchema {
   const error = jsonSchemaValidationError(schema);
   if (error) throw new Error(`structured output schema is invalid: ${error}`);
   const type = Type.Unsafe(schema as TSchema);
-  // Pi 0.84 checks this legacy symbol before applying an extra JSON-schema
+  // Pi 0.84 checks this TypeBox symbol before applying an extra JSON-schema
   // coercion pass. TypeBox 1.3 uses string metadata instead, so mark this
   // schema explicitly to keep Pi as strict as the Claude/Codex validators.
   Object.defineProperty(type, LEGACY_TYPEBOX_KIND, {

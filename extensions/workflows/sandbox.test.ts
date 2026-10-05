@@ -47,7 +47,7 @@ test("sandbox exposes only workflow capabilities and validates results", async (
   assert.deepEqual(phases, ["Gather"]);
 });
 
-test("sandbox passes the C1 agent option vocabulary and drops unknown keys", async () => {
+test("sandbox passes the agent option vocabulary and drops unknown keys", async () => {
   let received: unknown;
   const result = await run(
     `return await agent("review", {
@@ -56,8 +56,8 @@ test("sandbox passes the C1 agent option vocabulary and drops unknown keys", asy
       phase: "Review",
       schema: { type: "object", properties: {} },
       model: "gpt-test",
-      provider: "fixture",
       effort: "high",
+      preset: "implementer",
       unknown: "drop-me",
     });`,
     {
@@ -74,8 +74,8 @@ test("sandbox passes the C1 agent option vocabulary and drops unknown keys", asy
     phase: "Review",
     schema: { type: "object", properties: {} },
     model: "gpt-test",
-    provider: "fixture",
     effort: "high",
+    preset: "implementer",
   });
 });
 

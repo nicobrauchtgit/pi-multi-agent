@@ -21,8 +21,8 @@ import {
   createAgentSession,
   SessionManager,
 } from "@earendil-works/pi-coding-agent";
-import type { Cause, Scope } from "effect";
-import { Effect, Queue, Stream } from "effect";
+import type { Cause } from "effect";
+import { Effect, Exit, Queue, Result, Scope, Stream } from "effect";
 import type { SubagentBackend, SubagentSession } from "../backend.ts";
 import type {
   RunOutcome,
@@ -46,6 +46,16 @@ import {
 } from "../../../shared/structured-output.ts";
 import { createToolCallTimeoutGuard } from "../../../shared/tool-call-timeout.ts";
 import { MISSING_STRUCTURED_OUTPUT_ERROR } from "../structured-output.ts";
+import { handoffDecision } from "../handoff/policy.ts";
+import {
+  buildContinuationPrompt,
+  formatHandoffDocument,
+  handoffSummaryInstructions,
+} from "../handoff/prompt.ts";
+import {
+  createHandoffRecorder,
+  handoffDocumentFromAgentText,
+} from "../handoff/controller.ts";
 
 const CHILD_SHUTDOWN_TIMEOUT_MS = 5_000;
 const STRUCTURED_UNSET = Symbol("structured-output-unset");
@@ -251,7 +261,7 @@ function boundedError(error: unknown) {
   );
 }
 
-const makePiSession = (
+const makePiSessionSegment = (
   task: SpawnTask,
 ): Effect.Effect<SubagentSession, SpawnError, Scope.Scope> =>
   Effect.gen(function* () {
@@ -620,6 +630,262 @@ const makePiSession = (
       }),
     } satisfies SubagentSession;
   });
+
+export type PiSessionSegmentFactory = (
+  task: SpawnTask,
+) => Effect.Effect<SubagentSession, SpawnError, Scope.Scope>;
+
+/**
+ * Wrap fresh Pi session segments behind one logical backend session.
+ * The injectable segment factory keeps rollover lifecycle behavior hermetic in
+ * tests; production always supplies makePiSessionSegment.
+ */
+export const makePiHandoffSession = (
+  task: SpawnTask,
+  createSegment: PiSessionSegmentFactory,
+): Effect.Effect<SubagentSession, SpawnError, Scope.Scope> =>
+  Effect.gen(function* () {
+    const outerScope = yield* Effect.scope;
+    const events = yield* Queue.make<SubagentEvent, Cause.Done>();
+    const recorder = createHandoffRecorder(task.prompt);
+    const segments = new Set<Scope.Scope>();
+    let currentSession: SubagentSession | undefined;
+    let currentScope: Scope.Scope | undefined;
+    let currentMeta: SubagentMeta = { backend: "pi" };
+    let active = false;
+    let latestUsage: { tokens?: number; contextWindow?: number } = {};
+    let handoffCount = 0;
+    let closed = false;
+    let suppressSegmentEvents = false;
+    let handoffWaiter: ((outcome: RunOutcome) => void) | undefined;
+
+    const emit = (event: SubagentEvent) => Queue.offerUnsafe(events, event);
+
+    const recordEvent = (event: SubagentEvent) => {
+      switch (event._tag) {
+        case "RunStarted":
+          active = true;
+          break;
+        case "RunSettled":
+          active = false;
+          if (event.outcome._tag === "Completed") {
+            recorder.record({ kind: "final", text: event.outcome.finalText });
+          } else {
+            recorder.record({
+              kind: "error",
+              text:
+                event.outcome._tag === "Failed"
+                  ? event.outcome.errorText
+                  : event.outcome.errorText,
+            });
+          }
+          break;
+        case "UserMessage":
+          recorder.record({ kind: "user", text: event.text });
+          break;
+        case "AssistantMessage":
+          recorder.record({
+            kind: "assistant",
+            text: event.parts
+              .filter((part) => part.type === "text")
+              .map((part) => part.text)
+              .join("\n"),
+          });
+          break;
+        case "ToolEnd":
+          recorder.record({
+            kind: "tool",
+            name: event.name,
+            isError: event.isError,
+            text: event.outputPreview,
+          });
+          break;
+        case "UsageChanged":
+          latestUsage = {
+            tokens: event.tokens,
+            contextWindow: event.contextWindow,
+          };
+          recorder.record({ kind: "usage", ...latestUsage });
+          break;
+        case "MetaChanged":
+          currentMeta = { ...currentMeta, ...event.meta };
+          recorder.record({ kind: "meta" });
+          break;
+        case "BackendError":
+          recorder.record({ kind: "error", text: event.message });
+          break;
+        case "QueueChanged":
+        case "AssistantDelta":
+        case "ToolStart":
+        case "ToolUpdate":
+        case "Handoff":
+          break;
+      }
+    };
+
+    const closeSegment = (scope: Scope.Scope | undefined) =>
+      scope ? Scope.close(scope, Exit.void).pipe(Effect.ignore) : Effect.void;
+
+    const openSegment = (prompt: string) =>
+      Effect.gen(function* () {
+        const scope = yield* Scope.make();
+        const segment = yield* Scope.provide(
+          createSegment({ ...task, prompt, resume: undefined }),
+          scope,
+        ).pipe(Effect.onError(() => Scope.close(scope, Exit.void)));
+        segments.add(scope);
+        currentScope = scope;
+        currentSession = segment;
+        currentMeta = yield* segment.meta;
+        const pump = Stream.runForEach(segment.events, (event) =>
+          Effect.sync(() => {
+            if (suppressSegmentEvents) {
+              if (event._tag === "RunStarted") {
+                active = true;
+              } else if (event._tag === "RunSettled") {
+                active = false;
+                handoffWaiter?.(event.outcome);
+                handoffWaiter = undefined;
+              } else if (event._tag === "UsageChanged") {
+                latestUsage = {
+                  tokens: event.tokens,
+                  contextWindow: event.contextWindow,
+                };
+              } else if (event._tag === "MetaChanged") {
+                currentMeta = { ...currentMeta, ...event.meta };
+              }
+              return;
+            }
+            recordEvent(event);
+            emit(event);
+          }),
+        );
+        yield* Effect.forkIn(pump, outerScope);
+        return segment;
+      });
+
+    const continueInFreshSegment = (
+      nextPrompt: string,
+      document: ReturnType<
+        ReturnType<typeof createHandoffRecorder>["document"]
+      >,
+      reason: string,
+      from: SubagentMeta,
+    ) =>
+      Effect.gen(function* () {
+        if (currentScope) {
+          yield* closeSegment(currentScope);
+          segments.delete(currentScope);
+        }
+        handoffCount++;
+        const continuationPrompt = buildContinuationPrompt({
+          originalPrompt: task.prompt,
+          nextPrompt,
+          handoff: document,
+        });
+        const next = yield* openSegment(continuationPrompt);
+        const to = yield* next.meta;
+        emit({
+          _tag: "Handoff",
+          fromSessionId: from.nativeSessionId,
+          fromSessionFile: from.sessionFilePath,
+          toSessionId: to.nativeSessionId,
+          toSessionFile: to.sessionFilePath,
+          reason: reason || `handoff ${handoffCount}`,
+          summary: formatHandoffDocument(document),
+        });
+        suppressSegmentEvents = false;
+      });
+
+    const waitForInternalHandoff = () =>
+      new Promise<RunOutcome | undefined>((resolve) => {
+        const timer = setTimeout(() => {
+          if (handoffWaiter) handoffWaiter = undefined;
+          resolve(undefined);
+        }, 45_000);
+        handoffWaiter = (outcome) => {
+          clearTimeout(timer);
+          resolve(outcome);
+        };
+      });
+
+    const requestAgentHandoff = (reason: string) =>
+      Effect.gen(function* () {
+        const session = currentSession;
+        if (!session) return recorder.document(reason);
+        const fallback = recorder.document(reason);
+        suppressSegmentEvents = true;
+        try {
+          const waiting = waitForInternalHandoff();
+          const sent = yield* session
+            .send(handoffSummaryInstructions())
+            .pipe(Effect.result);
+          if (Result.isFailure(sent)) return fallback;
+          const outcome = yield* Effect.promise(() => waiting);
+          if (outcome?._tag !== "Completed") return fallback;
+          return handoffDocumentFromAgentText(outcome.finalText, fallback);
+        } finally {
+          suppressSegmentEvents = false;
+        }
+      });
+
+    const rollover = (nextPrompt: string) =>
+      Effect.gen(function* () {
+        const decision = handoffDecision(latestUsage);
+        if (!decision.shouldHandoff || !currentScope || !currentSession) {
+          yield* currentSession?.send(nextPrompt) ??
+            new SendError({ message: "Pi handoff session is not available." });
+          return;
+        }
+        const from = yield* currentSession.meta;
+        const reason = decision.reason ?? "handoff policy";
+        const document = yield* requestAgentHandoff(reason);
+        yield* continueInFreshSegment(nextPrompt, document, reason, from);
+      });
+
+    yield* openSegment(task.prompt);
+
+    yield* Effect.addFinalizer(() =>
+      Effect.gen(function* () {
+        closed = true;
+        for (const scope of segments) yield* closeSegment(scope);
+        Queue.endUnsafe(events);
+      }),
+    );
+
+    return {
+      meta: Effect.sync(() => currentMeta),
+      events: Stream.fromQueue(events),
+      send: (text) =>
+        Effect.suspend((): Effect.Effect<void, SendError> => {
+          if (closed) {
+            return new SendError({ message: "Subagent session is closed." });
+          }
+          const session = currentSession;
+          if (!session) {
+            return new SendError({ message: "Pi session is not available." });
+          }
+          if (active) return session.send(text);
+          return rollover(text).pipe(
+            Effect.mapError((error) =>
+              error instanceof SendError
+                ? error
+                : new SendError({ message: boundedError(error) }),
+            ),
+          );
+        }),
+      interrupt: Effect.suspend(() => currentSession?.interrupt ?? Effect.void),
+    } satisfies SubagentSession;
+  });
+
+const makePiSession = (
+  task: SpawnTask,
+): Effect.Effect<SubagentSession, SpawnError, Scope.Scope> => {
+  if (task.resume || task.schema !== undefined) {
+    return makePiSessionSegment(task);
+  }
+  return makePiHandoffSession(task, makePiSessionSegment);
+};
 
 export const piBackend: SubagentBackend = {
   name: "pi",

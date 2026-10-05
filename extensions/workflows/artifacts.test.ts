@@ -138,8 +138,8 @@ test("large per-agent structured values cannot destroy workflow core state", () 
         preview: "done",
         usage: emptyUsage(),
         transcript: [],
-        // Simulate a legacy/runtime object carrying the C1 mirror. The current
-        // AgentRecord contract intentionally omits it from workflow.json.
+        // Simulate an unexpected runtime object carrying a large structured
+        // mirror. The AgentRecord contract intentionally omits it from workflow.json.
         structured: { payload: "x".repeat(60 * 1024) },
       } as AgentRecord & { structured: unknown });
     }

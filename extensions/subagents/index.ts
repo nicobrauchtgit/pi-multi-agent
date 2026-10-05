@@ -47,34 +47,15 @@ import { Markdown, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import {
   assertChildWorkingDirectoryAllowed,
-  configureChildProtectedPaths,
   isChildExtensionLoad,
-  processRichCaptureAllowed,
 } from "../shared/child-session.ts";
 import { ensureBlackboard, withBlackboard } from "../shared/hunk-blackboard.ts";
-import { observabilityPaths } from "../shared/observability/home.mjs";
-import { parentIdentityFromPiSession } from "../shared/observability/ids.ts";
-import {
-  NOOP_OBSERVABILITY_SINK,
-  type ObservabilitySink,
-} from "../shared/observability/sink.ts";
 import {
   disposeProcessService,
   provideProcessService,
   type ProcessServiceHandle,
 } from "../shared/service-registry.ts";
 import { deriveBtwTitle, isModelVisible } from "./src/by-the-way.ts";
-import {
-  createDaemonController,
-  openObservabilityUi,
-  type DaemonController,
-} from "./src/daemon-control.ts";
-import { createParentHookObserver } from "./src/parent-hooks.ts";
-import { loadProducerConfig } from "./src/producer-config.ts";
-import {
-  createProducerSink,
-  type ProducerObservabilitySink,
-} from "./src/producer-sink.ts";
 import {
   BACKEND_NAMES,
   formatElapsed,
@@ -136,23 +117,6 @@ import { openSubagentPicker, openSubagentTakeover } from "./src/ui/takeover.ts";
 const SUBAGENT_OUTPUT_MAX_BYTES = 24 * 1024;
 const WAIT_OUTPUT_MAX_BYTES = 48 * 1024;
 const WAIT_PER_AGENT_MAX_BYTES = 16 * 1024;
-const OBSERVABILITY_TEST_AGENT_DIR_KEY = Symbol.for(
-  "pi-multi-agent.observability.test-agent-dir.v1",
-);
-
-function observabilityTestAgentDir() {
-  const root = globalThis as typeof globalThis & {
-    [OBSERVABILITY_TEST_AGENT_DIR_KEY]?: string;
-  };
-  const configured =
-    root[OBSERVABILITY_TEST_AGENT_DIR_KEY] ??
-    process.env.PI_OBSERVABILITY_TEST_AGENT_DIR;
-  if (configured) root[OBSERVABILITY_TEST_AGENT_DIR_KEY] = configured;
-  // Parent-test control only: never expose this companion path to a child or
-  // grandchild environment, including in-process Pi shell tools.
-  delete process.env.PI_OBSERVABILITY_TEST_AGENT_DIR;
-  return configured;
-}
 
 function schemaParameter(description: string) {
   return Type.Object(
@@ -268,20 +232,10 @@ export default function (pi: ExtensionAPI) {
   let serviceSessionId: string | undefined;
   let sessionActive = false;
   let serviceInitializationError: string | undefined;
-  let ownedSink: ObservabilitySink = NOOP_OBSERVABILITY_SINK;
-  let producerSink: ProducerObservabilitySink | undefined;
-  let daemonController: DaemonController | undefined;
   let ui: ExtensionUIContext | undefined;
   let unsubStatus: (() => void) | undefined;
   const resultDelivery = createDeferredResultDelivery<SubagentSnapshot>();
   const roleMetaFingerprints = new Map<string, string>();
-  // Test-only override keeps live acceptance daemon/storage isolated while Pi
-  // continues using its normal models/auth/config directory.
-  const paths = observabilityPaths(observabilityTestAgentDir());
-  const parentHooks = createParentHookObserver({
-    getSink: () => producerSink,
-  });
-
   const initializeService = () => {
     if (!sessionActive || !sessionContext) {
       throw new Error("The subagent session is not active.");
@@ -291,88 +245,7 @@ export default function (pi: ExtensionAPI) {
     }
     if (runtime && managerPromise && serviceHandle?.isCurrent()) return;
 
-    const loadedConfig = loadProducerConfig(paths);
-    configureChildProtectedPaths({
-      agentDir: getAgentDir(),
-      moshiPaths: loadedConfig.config.moshiPaths,
-      additionalRoots: [paths.root],
-    });
-    let createdSink: ObservabilitySink = NOOP_OBSERVABILITY_SINK;
-    let createdProducer: ProducerObservabilitySink | undefined;
-    let createdController: DaemonController | undefined;
-    if (!loadedConfig.valid && ui) {
-      ui.setStatus("observability", "observability: disabled");
-      ui.notify(
-        `Local observability configuration failed closed (${loadedConfig.reason ?? "invalid"}).`,
-        "warning",
-      );
-    }
-    if (loadedConfig.valid && loadedConfig.config.capture !== "off") {
-      try {
-        const richAllowed = processRichCaptureAllowed();
-        const richForcedMetadata =
-          loadedConfig.config.capture === "rich" && !richAllowed;
-        createdController = createDaemonController({
-          paths,
-          autostart: loadedConfig.config.autostart,
-          onTransition: (health, reason) => {
-            if (ui) {
-              ui.setStatus(
-                "observability",
-                health === "healthy"
-                  ? richForcedMetadata
-                    ? "observability: metadata-only"
-                    : undefined
-                  : `observability: ${health}`,
-              );
-              ui.notify(
-                health === "healthy"
-                  ? "Local observability daemon is healthy."
-                  : `Local observability is ${health} (${reason}); orchestration continues in bounded spool mode.`,
-                health === "healthy" ? "info" : "warning",
-              );
-            }
-          },
-        });
-        createdProducer = createProducerSink({
-          paths,
-          config: loadedConfig.config,
-          // Shared same-UID storage plus unbounded shell/Codex reads make rich
-          // unsafe today. An explicit rich config is narrowed to metadata.
-          richAllowed,
-          ensureDaemon: () => createdController!.ensureDaemon(),
-          onHealth: (health, reason) =>
-            createdController?.reportTransportState(health, reason),
-        });
-        if (richForcedMetadata) {
-          createdProducer.recordDiagnostic("rich-forced-metadata");
-          if (ui) {
-            ui.setStatus("observability", "observability: metadata-only");
-            ui.notify(
-              "Rich observability was forced to metadata-only because one or more child backends lack a protected same-UID read/shell boundary.",
-              "warning",
-            );
-          }
-        }
-        createdSink = createdProducer;
-      } catch (error) {
-        createdController = undefined;
-        createdProducer = undefined;
-        createdSink = NOOP_OBSERVABILITY_SINK;
-        if (ui) {
-          const reason =
-            error && typeof error === "object" && "code" in error
-              ? String(error.code)
-              : "producer-initialization-failed";
-          ui.setStatus("observability", "observability: disabled");
-          ui.notify(
-            `Local observability initialization failed closed (${reason}); subagent and workflow tools remain available.`,
-            "warning",
-          );
-        }
-      }
-    }
-    const createdRuntime = createSubagentRuntime(createdSink);
+    const createdRuntime = createSubagentRuntime();
     const createdManager = createdRuntime
       .runPromise(SubagentManager)
       .then((manager) => {
@@ -403,7 +276,6 @@ export default function (pi: ExtensionAPI) {
       createdHandle = provideProcessService({
         runtime: createdRuntime,
         manager: createdManager,
-        sink: createdSink,
       });
     } catch (error) {
       void createdRuntime.dispose();
@@ -412,9 +284,6 @@ export default function (pi: ExtensionAPI) {
     runtime = createdRuntime;
     managerPromise = createdManager;
     serviceHandle = createdHandle;
-    ownedSink = createdSink;
-    producerSink = createdProducer;
-    daemonController = createdController;
   };
 
   const getRuntime = () => {
@@ -569,15 +438,10 @@ export default function (pi: ExtensionAPI) {
     const closingRuntime = runtime;
     const closingManager = managerPromise;
     const closingHandle = serviceHandle;
-    const closingSink = ownedSink;
-    const closingProducer = producerSink;
     runtime = undefined;
     managerPromise = undefined;
     serviceHandle = undefined;
     serviceSessionId = undefined;
-    ownedSink = NOOP_OBSERVABILITY_SINK;
-    producerSink = undefined;
-    daemonController = undefined;
     if (closingHandle) {
       disposeProcessService(closingHandle.ownerToken, reason);
     }
@@ -590,10 +454,6 @@ export default function (pi: ExtensionAPI) {
       }
     } catch {
       // Runtime disposal remains the final bounded cleanup.
-    }
-    if (closingHandle) {
-      if (closingProducer) await closingProducer.close(250).catch(() => {});
-      else await closingSink.flush(250).catch(() => {});
     }
     await closingRuntime?.dispose();
   };
@@ -616,9 +476,6 @@ export default function (pi: ExtensionAPI) {
     if (ctx.hasUI) ui = ctx.ui;
     try {
       initializeService();
-      parentHooks.sessionStart(_event, ctx);
-      // Lazy, once-per-service autostart. Startup and agent work never wait.
-      void daemonController?.ensureDaemon();
     } catch (error) {
       serviceInitializationError = `Subagent service initialization failed: ${
         error instanceof Error ? error.message : String(error)
@@ -627,29 +484,18 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
-  pi.on("agent_settled", async (_event, ctx) => {
+  pi.on("agent_settled", async () => {
     flushResults();
-    // Print mode exits after this run and has no later interactive prompt. Some
-    // hosts tear it down without a separately awaitable shutdown hook, so seal
-    // the root run here; session_shutdown is idempotent if it follows.
-    if (ctx.mode === "print") {
-      parentHooks.sessionShutdown({ reason: "agent-settled" }, ctx);
-      await producerSink?.flush(250).catch(() => {});
-    }
   });
 
-  pi.on("session_shutdown", async (event, ctx) => {
-    parentHooks.sessionShutdown(event, ctx);
+  pi.on("session_shutdown", async () => {
     sessionActive = false;
     sessionContext = undefined;
     serviceInitializationError = undefined;
     ui?.setStatus("subagents", undefined);
-    ui?.setStatus("observability", undefined);
     ui = undefined;
     await closeOwnedService("Subagent service was reloaded or shut down");
   });
-
-  parentHooks.register(pi);
 
   // --- Tools -------------------------------------------------------------
 
@@ -726,7 +572,6 @@ export default function (pi: ExtensionAPI) {
           reasoningEffort: params.reasoning_effort,
           parent: {
             parentCwd: ctx.cwd,
-            ...parentIdentityFromPiSession(ctx.sessionManager.getSessionId()),
             projectTrusted: resolveChildProjectTrust({
               parentCwd: ctx.cwd,
               childCwd: cwd,
@@ -1244,7 +1089,6 @@ export default function (pi: ExtensionAPI) {
           reasoningEffort,
           parent: {
             parentCwd: ctx.cwd,
-            ...parentIdentityFromPiSession(ctx.sessionManager.getSessionId()),
             projectTrusted: resolveChildProjectTrust({
               parentCwd: ctx.cwd,
               childCwd: cwd,
@@ -1485,7 +1329,6 @@ export default function (pi: ExtensionAPI) {
           cwd: ctx.cwd,
           parent: {
             parentCwd: ctx.cwd,
-            ...parentIdentityFromPiSession(ctx.sessionManager.getSessionId()),
             projectTrusted: ctx.isProjectTrusted(),
             inheritedModel: ctx.model
               ? { provider: ctx.model.provider, id: ctx.model.id }
@@ -1507,33 +1350,6 @@ export default function (pi: ExtensionAPI) {
       badge: "by the way",
     });
   };
-
-  pi.registerCommand("observability", {
-    description: "Open the local read-only observability UI",
-    handler: async (_args, ctx) => {
-      if (ctx.mode !== "tui") {
-        if (ctx.hasUI) {
-          ctx.ui.notify(
-            "The observability browser command is only available in the local TUI.",
-            "error",
-          );
-        }
-        return;
-      }
-      try {
-        initializeService();
-        if (!daemonController) throw new Error("observability-disabled");
-        const url = await daemonController.readUiUrl();
-        await openObservabilityUi(url);
-        ctx.ui.notify("Opened the local read-only observability UI.", "info");
-      } catch {
-        ctx.ui.notify(
-          "The local observability UI is unavailable. Orchestration is unaffected.",
-          "error",
-        );
-      }
-    },
-  });
 
   pi.registerCommand("btw", {
     description:

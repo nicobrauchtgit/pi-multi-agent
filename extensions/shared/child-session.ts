@@ -11,8 +11,38 @@ import {
   type SessionShutdownEvent,
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
-import { observabilityPaths } from "./observability/home.mjs";
-import { canonicalizePath, pathContains } from "./observability/policy.mjs";
+
+function canonicalizePath(value: string, cwd: string = process.cwd()): string {
+  const resolved = path.resolve(cwd, value);
+  let cursor = resolved;
+  const suffix: string[] = [];
+  while (true) {
+    try {
+      const canonical = fs.realpathSync.native(cursor);
+      return path.join(canonical, ...suffix.reverse());
+    } catch (error) {
+      if (
+        !error ||
+        typeof error !== "object" ||
+        (error as { code?: unknown }).code !== "ENOENT"
+      ) {
+        throw error;
+      }
+      const parent = path.dirname(cursor);
+      if (parent === cursor) return resolved;
+      suffix.push(path.basename(cursor));
+      cursor = parent;
+    }
+  }
+}
+
+function pathContains(root: string, candidate: string): boolean {
+  const relative = path.relative(root, candidate);
+  return (
+    relative === "" ||
+    (!relative.startsWith("..") && !path.isAbsolute(relative))
+  );
+}
 
 const CHILD_SHUTDOWN_TIMEOUT_MS = 5_000;
 const CHILD_EXTENSION_SCOPE_KEY = Symbol.for(
@@ -390,13 +420,11 @@ export function protectedPathPolicy(
   } = {},
 ): ProtectedPathPolicy {
   const configured = childProtectedPathConfig();
-  const paths = observabilityPaths(options.agentDir ?? configured.agentDir);
+  const agentDir = options.agentDir ?? configured.agentDir;
   const candidates = [
-    paths.root,
-    paths.rolesDir,
-    paths.workflowsDir,
-    paths.runArtifactsDir,
-    paths.exportDir,
+    path.join(agentDir, "multi-agent", "roles"),
+    path.join(agentDir, "workflows"),
+    path.join(agentDir, "multi-agent", "artifacts"),
     ...(options.moshiPaths ?? configured.moshiPaths),
     ...(options.additionalRoots ?? configured.additionalRoots),
   ];
@@ -496,7 +524,7 @@ export function assertChildWorkingDirectoryAllowed(
 export class ProtectedPathAccessError extends Error {
   constructor(toolName: string) {
     super(
-      `Tool call "${toolName}" cannot access protected parent observability state.`,
+      `Tool call "${toolName}" cannot access protected parent orchestration state.`,
     );
     this.name = "ProtectedPathAccessError";
   }
@@ -552,15 +580,11 @@ export const CHILD_BACKEND_PATH_CAPABILITIES = Object.freeze({
   codex: Object.freeze({ fileTools: false, shell: false, richCapture: false }),
 });
 
-/** Remove observability-only controls before any external child/grandchild. */
+/** Copy the parent environment before passing it to an external child. */
 export function childProcessEnvironment(
   source: NodeJS.ProcessEnv = process.env,
 ): NodeJS.ProcessEnv {
-  return Object.fromEntries(
-    Object.entries(source).filter(
-      ([key]) => !key.startsWith("PI_OBSERVABILITY_"),
-    ),
-  );
+  return { ...source };
 }
 
 export function processRichCaptureAllowed(

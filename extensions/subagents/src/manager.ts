@@ -13,7 +13,6 @@
 
 import { isDeepStrictEqual } from "node:util";
 import {
-  Cause,
   Context,
   Effect,
   Exit,
@@ -47,23 +46,10 @@ import {
 } from "./domain.ts";
 import {
   mintAgentId,
-  mintEphemeralParentIdentity,
   mintStandaloneRunId,
   mintTurnId,
   type TurnId,
-} from "../../shared/observability/ids.ts";
-import {
-  NOOP_OBSERVABILITY_SINK,
-  NoopObservabilitySinkLayer,
-  ObservabilitySinkService,
-  safeEmit,
-} from "../../shared/observability/sink.ts";
-import {
-  agentCreatedEvent,
-  agentSettledEvent,
-  spawnFailureEvents,
-  subagentEvent,
-} from "./observability.ts";
+} from "../../shared/ids.ts";
 import {
   JSON_SCHEMA_MAX_BYTES,
   STRUCTURED_OUTPUT_MAX_BYTES,
@@ -85,13 +71,6 @@ const WORKFLOW_OUTPUT_MAX_BYTES = 64 * 1_024;
 
 function bounded(text: string) {
   return text.slice(0, ERROR_TEXT_MAX_LENGTH);
-}
-
-function causeMessage(cause: Cause.Cause<unknown>): string {
-  const squashed = Cause.squash(cause);
-  if (squashed instanceof Error) return squashed.message || squashed.name;
-  const message = String(squashed);
-  return message || "Subagent spawn interrupted or failed";
 }
 
 function boundedTranscriptText(text: string) {
@@ -393,7 +372,6 @@ export class SubagentManager extends Context.Service<
 
 const makeManager = Effect.gen(function* () {
   const registry = yield* BackendRegistry;
-  const observabilitySink = yield* ObservabilitySinkService;
   // Detached forker for sync contexts (read-model commands, pruning) that
   // preserves the manager's services instead of using the global runtime.
   const runDetached = Effect.runForkWith(yield* Effect.context());
@@ -426,21 +404,6 @@ const makeManager = Effect.gen(function* () {
   const admissionWaiters: AdmissionWaiter[] = [];
   let onSettled:
     ((snap: SubagentSnapshot, consumed: boolean) => void) | undefined;
-
-  type PendingEvent = Parameters<typeof observabilitySink.emit>[0];
-  const observe = (
-    build: () => PendingEvent | ReadonlyArray<PendingEvent> | undefined,
-  ) => {
-    if (observabilitySink === NOOP_OBSERVABILITY_SINK) return;
-    try {
-      const built = build();
-      if (!built) return;
-      const events = Array.isArray(built) ? built : [built];
-      for (const event of events) safeEmit(observabilitySink, event);
-    } catch {
-      // Normalization and sink bugs are both outside manager lifecycle state.
-    }
-  };
 
   const notify = (id?: string) => {
     const waiters = changeWaiters;
@@ -670,14 +633,6 @@ const makeManager = Effect.gen(function* () {
     } catch {
       // The parent session may be unavailable; settlement stays final.
     }
-    observe(() =>
-      agentSettledEvent(
-        s,
-        outcome,
-        entry.runCount,
-        entry.runStartedAt ?? s.createdAt,
-      ),
-    );
     entry.turnPromotedBeforeRunStart = false;
     drainAdmissionWaiters();
     pruneSettled();
@@ -704,8 +659,8 @@ const makeManager = Effect.gen(function* () {
         s.status = "running";
         s.settledAt = undefined;
         s.errorText = undefined;
-        // Structured state is per run. Unlike finalText's compatibility
-        // preview, it must never expose the previous turn as the current one.
+        // Structured state is per run. Unlike finalText preview, it must never
+        // expose the previous turn as the current one.
         s.structured = undefined;
         s.schemaError = undefined;
         break;
@@ -832,6 +787,13 @@ const makeManager = Effect.gen(function* () {
       case "MetaChanged":
         s.meta = { ...s.meta, ...event.meta };
         break;
+      case "Handoff":
+        s.meta = {
+          ...s.meta,
+          sessionFilePath: event.toSessionFile ?? s.meta.sessionFilePath,
+          nativeSessionId: event.toSessionId ?? s.meta.nativeSessionId,
+        };
+        break;
       case "BackendError":
         s.errorText = bounded(event.message);
         break;
@@ -850,7 +812,6 @@ const makeManager = Effect.gen(function* () {
     } = {},
   ) =>
     Effect.gen(function* () {
-      let reservedAt = 0;
       let reservedTask!: SpawnTask & { readonly identity: SubagentIdentity };
       let pinnedAgentId: string | undefined;
       // Reserve and mint synchronously before availability probing or backend
@@ -953,7 +914,6 @@ const makeManager = Effect.gen(function* () {
             );
           }
 
-          const fallbackParent = mintEphemeralParentIdentity();
           const identity: SubagentIdentity = Object.freeze({
             runId:
               origin === "workflow"
@@ -962,20 +922,13 @@ const makeManager = Effect.gen(function* () {
             agentId: mintAgentId(),
             turnId: mintTurnId(),
             origin,
-            parentRunId:
-              normalizedTask.parent.rootRunId ?? fallbackParent.rootRunId,
-            traceId: normalizedTask.parent.traceId ?? fallbackParent.traceId,
           });
           reservedTask = Object.freeze({ ...normalizedTask, identity });
-          reservedAt = Date.now();
           reserved++;
           if (options.collect) {
             pinnedAgentId = identity.agentId;
             collectionPins.add(identity.agentId);
           }
-          observe(() =>
-            agentCreatedEvent(backendName, reservedTask, reservedAt),
-          );
           return Effect.void;
         },
       );
@@ -1067,7 +1020,6 @@ const makeManager = Effect.gen(function* () {
         const pump = Stream.runForEach(session.events, (event) =>
           Effect.sync(() => {
             foldEvent(entry, event);
-            observe(() => subagentEvent(entry.snapshot, event, entry.runCount));
           }),
         ).pipe(
           Effect.ensuring(
@@ -1090,14 +1042,6 @@ const makeManager = Effect.gen(function* () {
       return yield* doSpawn.pipe(
         Effect.onError((cause) =>
           Effect.sync(() => {
-            observe(() =>
-              spawnFailureEvents({
-                backend: backendName,
-                task: reservedTask,
-                createdAt: reservedAt,
-                message: causeMessage(cause),
-              }),
-            );
             reservedTask.roleLease?.release();
             if (pinnedAgentId) collectionPins.delete(pinnedAgentId);
           }),
@@ -1465,15 +1409,8 @@ const makeManager = Effect.gen(function* () {
   });
 });
 
-export const SubagentManagerWithSink: Layer.Layer<
-  SubagentManager,
-  never,
-  BackendRegistry | ObservabilitySinkService
-> = Layer.effect(SubagentManager, makeManager);
-
-/** Default C0 manager: shared sink seam present, production behavior is no-op. */
 export const SubagentManagerLive: Layer.Layer<
   SubagentManager,
   never,
   BackendRegistry
-> = SubagentManagerWithSink.pipe(Layer.provide(NoopObservabilitySinkLayer));
+> = Layer.effect(SubagentManager, makeManager);

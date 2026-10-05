@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { bindChildSessionExtensions } from "./child-session.ts";
-import { NOOP_OBSERVABILITY_SINK } from "./observability/sink.ts";
 import {
   acquireProcessService,
   currentProcessService,
@@ -14,7 +13,6 @@ function resources(name: string) {
   return {
     runtime: { name },
     manager: Promise.resolve({ name }),
-    sink: NOOP_OBSERVABILITY_SINK,
   };
 }
 

@@ -8,7 +8,7 @@
  *   export const meta = { name, description, phases: [{ title, detail? }] }
  *   phase(title)                                  // mark runtime phase progression
  *   log(message)                                  // append a bounded script log line
- *   await agent(prompt, { harness?, label?, phase?, schema?, model?, provider?, effort? })
+ *   await agent(prompt, { harness?, label?, phase?, schema?, model?, effort? })
  *   await parallel([() => agent(...), ...], { concurrency? })
  *   await pipeline(items, stageFn, ...)           // per-item sequential stages, items fan out
  *   args, cwd, process.cwd()                      // tool args and parent cwd
@@ -37,10 +37,7 @@ import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type, type Static } from "typebox";
 import { formatActivityStatus } from "../shared/activity-status.ts";
 import { isChildExtensionLoad } from "../shared/child-session.ts";
-import {
-  isWorkflowRunId,
-  parentIdentityFromPiSession,
-} from "../shared/observability/ids.ts";
+import { isWorkflowRunId } from "../shared/ids.ts";
 import {
   acquireProcessService,
   type ProcessServiceHandle,
@@ -63,7 +60,6 @@ import {
   prepareWorkflowScript,
   type WorkflowMeta,
 } from "./meta.ts";
-import { createWorkflowRunEmitter } from "./observability.ts";
 import {
   agentContext,
   aggregateUsage,
@@ -415,13 +411,6 @@ export default function workflows(pi: ExtensionAPI) {
         agents: [],
         logs: [],
       };
-      const workflowEvents = createWorkflowRunEmitter({
-        runId,
-        sessionId: details.sessionId,
-        cwd: ctx.cwd,
-        sink: service.sink,
-      });
-
       writeRunFile(runDir, "script.js", params.script);
       if (params.args !== undefined)
         writeRunFile(runDir, "args.json", params.args);
@@ -442,7 +431,6 @@ export default function workflows(pi: ExtensionAPI) {
       // /reload and must never be retained by background work.
       const parentContext: ParentContext = {
         parentCwd: ctx.cwd,
-        ...parentIdentityFromPiSession(ctx.sessionManager.getSessionId()),
         projectTrusted: ctx.isProjectTrusted(),
         inheritedModel: ctx.model
           ? { provider: ctx.model.provider, id: ctx.model.id }
@@ -487,7 +475,6 @@ export default function workflows(pi: ExtensionAPI) {
         if (details.logs.length > WORKFLOW_LOG_MAX_LINES) {
           details.logs.splice(0, details.logs.length - WORKFLOW_LOG_MAX_LINES);
         }
-        workflowEvents.log(text);
         emit();
       };
 
@@ -499,7 +486,6 @@ export default function workflows(pi: ExtensionAPI) {
         details.currentPhase = text;
         if (!details.phases.some((p) => p.title === text))
           details.phases.push({ title: text });
-        workflowEvents.phase(details, text);
         emit();
       };
 
@@ -625,7 +611,6 @@ export default function workflows(pi: ExtensionAPI) {
             "abort",
             onServiceShutdown,
           );
-          workflowEvents.settled(details);
           flushNow();
         }
       };
@@ -638,9 +623,6 @@ export default function workflows(pi: ExtensionAPI) {
         completion?: Promise<void>;
       };
       activeRuns.set(runId, activeRun);
-      // Publish only after synchronous initialization. From this point onward,
-      // runScript()'s finally guarantees a matching workflow.settled event.
-      workflowEvents.started(details);
       const completion = runScript();
       activeRun.completion = completion;
       if (ctx.hasUI) lastUi = ctx.ui;

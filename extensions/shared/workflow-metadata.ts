@@ -1,4 +1,4 @@
-import { isWorkflowRunId } from "./observability/ids.ts";
+import { isWorkflowRunId } from "./ids.ts";
 import { truncateUtf8 } from "./text.ts";
 
 export const WORKFLOW_METADATA_TEXT_MAX_BYTES = 256;

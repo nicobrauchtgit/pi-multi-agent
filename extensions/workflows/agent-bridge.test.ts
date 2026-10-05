@@ -2,7 +2,6 @@ import assert from "node:assert/strict";
 import { tmpdir } from "node:os";
 import test from "node:test";
 import { Effect, Layer, ManagedRuntime, Queue, Stream } from "effect";
-import { NOOP_OBSERVABILITY_SINK } from "../shared/observability/sink.ts";
 import type { ProcessServiceHandle } from "../shared/service-registry.ts";
 import {
   BackendRegistry,
@@ -17,10 +16,9 @@ import type {
 } from "../subagents/src/domain.ts";
 import {
   SubagentManager,
-  SubagentManagerWithSink,
+  SubagentManagerLive,
   type SubagentManagerShape,
 } from "../subagents/src/manager.ts";
-import { ObservabilitySinkService } from "../shared/observability/sink.ts";
 import type { SubagentRuntime } from "../subagents/src/runtime.ts";
 import {
   applyManagerSnapshotToAgentRecord,
@@ -101,12 +99,7 @@ function registry(backends?: SubagentBackend[]) {
 
 function runtime(backends?: SubagentBackend[]) {
   return ManagedRuntime.make(
-    SubagentManagerWithSink.pipe(
-      Layer.provide(registry(backends)),
-      Layer.provide(
-        Layer.succeed(ObservabilitySinkService, NOOP_OBSERVABILITY_SINK),
-      ),
-    ),
+    SubagentManagerLive.pipe(Layer.provide(registry(backends))),
   );
 }
 
@@ -124,7 +117,6 @@ function service(
     ownerToken: "test-owner",
     runtime: managed,
     manager: Promise.resolve(manager),
-    sink: NOOP_OBSERVABILITY_SINK,
     shutdownSignal: lifecycle.shutdown.signal,
     isCurrent: () => lifecycle.current && !lifecycle.shutdown.signal.aborted,
   };
@@ -203,7 +195,7 @@ test("Pi, Claude, and Codex workflow calls return structured manager results", a
   });
 });
 
-test("harness model, provider migration shim, and effort map into SpawnTask", async () => {
+test("harness model and effort map into SpawnTask", async () => {
   const seen: Array<{ backend: BackendName; task: SpawnTask }> = [];
   const capture = (name: BackendName): SubagentBackend => ({
     name,
@@ -242,8 +234,7 @@ test("harness model, provider migration shim, and effort map into SpawnTask", as
         (
           await execute(processService, record(1), {
             harness: "pi",
-            provider: "fixture",
-            model: "pi-model",
+            model: "fixture/pi-model",
             effort: "xhigh",
           })
         ).ok,
@@ -297,11 +288,11 @@ test("harness model, provider migration shim, and effort map into SpawnTask", as
   );
 });
 
-test("invalid harness/provider/effort/schema errors never throw into scripts", async () => {
+test("invalid harness/model/effort/schema errors never throw into scripts", async () => {
   await withBridge(async ({ manager, service: processService }) => {
     for (const options of [
       { harness: "other" },
-      { harness: "claude", provider: "fixture", model: "pi-model" },
+      { harness: "pi", model: "" },
       { harness: "pi", effort: "impossible" },
       { harness: "pi", schema: { type: "string" } },
       {
@@ -469,8 +460,6 @@ test("snapshot adapter preserves normalized timing, usage, preview, and bounds",
       agentId: "agent_11111111-1111-4111-8111-111111111111",
       turnId: "turn_11111111-1111-4111-8111-111111111111",
       origin: "workflow",
-      parentRunId: "pi-run:test",
-      traceId: "pi-session:test",
     },
     origin: "workflow",
     autoDeliver: false,

@@ -51,7 +51,7 @@ test("ordinary role updates preserve an existing native locator", () => {
   });
 });
 
-test("role records round-trip bounded schemas and remain backward compatible", () => {
+test("role records round-trip bounded schemas and reject invalid schema payloads", () => {
   withAgentDir((agentDir) => {
     const schema = {
       type: "object",
@@ -72,14 +72,14 @@ test("role records round-trip bounded schemas and remain backward compatible", (
 
     upsertRole(
       {
-        role: "legacy-reviewer",
-        title: "legacy",
+        role: "plain-reviewer",
+        title: "plain",
         backend: "claude",
         cwd: "/tmp/repo",
       },
       agentDir,
     );
-    assert.equal(getRole("legacy-reviewer", agentDir)?.schema, undefined);
+    assert.equal(getRole("plain-reviewer", agentDir)?.schema, undefined);
 
     const file = path.join(
       getRolesDir(agentDir),
@@ -112,8 +112,6 @@ test("settlement role updates preserve the session schema", () => {
         agentId: "agent_00000000-0000-4000-8000-000000000001",
         turnId: "turn_00000000-0000-4000-8000-000000000001",
         origin: "model",
-        parentRunId: "pi-run:test",
-        traceId: "pi-session:test",
       },
       origin: "model",
       autoDeliver: true,

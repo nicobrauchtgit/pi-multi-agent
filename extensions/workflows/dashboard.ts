@@ -26,7 +26,7 @@ import {
   wrapTextWithAnsi,
   type TUI,
 } from "@earendil-works/pi-tui";
-import { isAgentId, isWorkflowRunId } from "../shared/observability/ids.ts";
+import { isAgentId, isWorkflowRunId } from "../shared/ids.ts";
 import { truncateUtf8 } from "../shared/text.ts";
 import {
   WORKFLOW_AGENT_INDEX_MAX,
@@ -332,7 +332,7 @@ export function loadRunEntries(
               ),
             );
           } catch {
-            // Keep the compact compatibility marker from workflow.json.
+            // Keep the compact result marker from workflow.json.
           }
         }
         if (details.transcriptArtifact) {
@@ -349,7 +349,7 @@ export function loadRunEntries(
               );
             }
           } catch {
-            // Older or partially written artifacts simply lack transcripts.
+            // Partially written artifacts simply lack transcripts.
           }
         }
         if (details.status === "running") {

@@ -4,8 +4,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { ModelRegistry, ModelRuntime } from "@earendil-works/pi-coding-agent";
-import { parentIdentityFromPiSession } from "../shared/observability/ids.ts";
-import { NOOP_OBSERVABILITY_SINK } from "../shared/observability/sink.ts";
 import {
   acquireProcessService,
   disposeProcessService,
@@ -45,7 +43,6 @@ async function liveContext() {
   const parent: ParentContext = {
     parentCwd: process.cwd(),
     projectTrusted: false,
-    ...parentIdentityFromPiSession("live-workflow-test"),
     inheritedModel: { provider, id },
     inheritedThinkingLevel: "off",
     modelRegistry,
@@ -54,7 +51,6 @@ async function liveContext() {
   provideProcessService({
     runtime,
     manager: Promise.resolve(manager),
-    sink: NOOP_OBSERVABILITY_SINK,
   });
   const service = await acquireProcessService<
     SubagentRuntime,
@@ -86,7 +82,7 @@ test(
       const source = `
         const S = { type: "object", properties: { word: { type: "string" } }, required: ["word"], additionalProperties: false };
         return await parallel([
-          () => agent("Return word pi via structured output.", { harness: "pi", provider: ${JSON.stringify(context.provider)}, model: ${JSON.stringify(context.id)}, effort: "off", label: "pi", schema: S }),
+          () => agent("Return word pi via structured output.", { harness: "pi", model: ${JSON.stringify(`${context.provider}/${context.id}`)}, effort: "off", label: "pi", schema: S }),
           () => agent("Return only JSON with word claude.", { harness: "claude", model: "haiku", effort: "off", label: "claude", schema: S }),
           () => agent("Return JSON with word codex.", { harness: "codex", effort: "low", label: "codex", schema: S }),
         ]);

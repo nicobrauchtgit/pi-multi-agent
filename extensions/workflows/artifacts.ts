@@ -1,5 +1,5 @@
 import * as path from "node:path";
-import { isWorkflowRunId } from "../shared/observability/ids.ts";
+import { isWorkflowRunId } from "../shared/ids.ts";
 import { truncateUtf8 } from "../shared/text.ts";
 import {
   WORKFLOW_AGENT_INDEX_MAX,

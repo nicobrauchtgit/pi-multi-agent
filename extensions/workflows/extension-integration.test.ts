@@ -10,10 +10,6 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { Effect, Layer, ManagedRuntime, Stream } from "effect";
 import {
-  ObservabilitySinkService,
-  createRecordingSink,
-} from "../shared/observability/sink.ts";
-import {
   disposeProcessService,
   provideProcessService,
   resetProcessServiceRegistryForTests,
@@ -24,7 +20,7 @@ import {
 } from "../subagents/src/backend.ts";
 import {
   SubagentManager,
-  SubagentManagerWithSink,
+  SubagentManagerLive,
 } from "../subagents/src/manager.ts";
 import workflows from "./index.ts";
 import type { WorkflowDetails } from "./model.ts";
@@ -134,20 +130,17 @@ test("workflow tool acquires the process service and persists manager-backed wor
   await Promise.all([mkdir(agentDir), mkdir(project)]);
   process.env.PI_CODING_AGENT_DIR = agentDir;
   resetProcessServiceRegistryForTests();
-  const sink = createRecordingSink();
   const runtime = ManagedRuntime.make(
-    SubagentManagerWithSink.pipe(
+    SubagentManagerLive.pipe(
       Layer.provide(
         Layer.succeed(BackendRegistry, new Map([["codex", instantBackend()]])),
       ),
-      Layer.provide(Layer.succeed(ObservabilitySinkService, sink)),
     ),
   );
   const manager = await runtime.runPromise(SubagentManager);
   const service = provideProcessService({
     runtime,
     manager: Promise.resolve(manager),
-    sink,
   });
   const harness = extensionHarness();
   const ctx = context(project);
@@ -189,11 +182,6 @@ test("workflow tool acquires the process service and persists manager-backed wor
     assert.equal(artifact.status, "completed");
     assert.equal(artifact.agents[0]?.state, "done");
 
-    const kinds = sink.events.map((event) => event.kind);
-    assert.ok(kinds.includes("workflow.started"));
-    assert.ok(kinds.includes("agent.created"));
-    assert.ok(kinds.includes("agent.settled"));
-    assert.ok(kinds.includes("workflow.settled"));
     await emit(harness, "session_shutdown");
   } finally {
     disposeProcessService(service.ownerToken, "Integration test finished");

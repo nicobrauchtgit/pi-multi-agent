@@ -1,4 +1,3 @@
-import type { ModelRegistry } from "@earendil-works/pi-coding-agent";
 import {
   codexJsonSchemaCompatibilityError,
   jsonSchemaValidationError,
@@ -22,6 +21,7 @@ import type {
   SubagentManagerShape,
 } from "../subagents/src/manager.ts";
 import type { SubagentRuntime } from "../subagents/src/runtime.ts";
+import { resolveAgentPreset } from "./agent-presets.ts";
 import { buildWorkflowAgentPrompt } from "./prompt.ts";
 import { emptyUsage, type AgentRecord, type TranscriptEntry } from "./model.ts";
 
@@ -37,8 +37,8 @@ export interface WorkflowAgentCallOptions {
   readonly phase?: unknown;
   readonly schema?: unknown;
   readonly model?: unknown;
-  readonly provider?: unknown;
   readonly effort?: unknown;
+  readonly preset?: unknown;
 }
 
 export interface ScriptAgentResult {
@@ -245,40 +245,15 @@ function resolveEffort(value: unknown): ReasoningEffort | undefined {
   return effort as ReasoningEffort;
 }
 
-function resolveModel(options: {
-  harness: BackendName;
-  model: unknown;
-  provider: unknown;
-  registry?: ModelRegistry;
-}) {
-  const provider =
-    options.provider === undefined
-      ? undefined
-      : typeof options.provider === "string"
-        ? options.provider.trim()
-        : undefined;
+function resolveModel(options: { model: unknown }) {
   const model =
     options.model === undefined
       ? undefined
       : typeof options.model === "string"
         ? options.model.trim()
         : undefined;
-  if (options.provider !== undefined && !provider) {
-    throw new Error("provider must be a non-empty string");
-  }
   if (options.model !== undefined && !model) {
     throw new Error("model must be a non-empty string");
-  }
-  if (options.harness !== "pi" && provider !== undefined) {
-    throw new Error(
-      `provider is supported only with harness "pi"; ${options.harness} models use their native alias/slug`,
-    );
-  }
-  if (provider !== undefined) {
-    if (!model) throw new Error("`provider` requires `model` as well");
-    const resolved = options.registry?.find(provider, model);
-    if (!resolved) throw new Error(`unknown model "${provider}/${model}"`);
-    return `${resolved.provider}/${resolved.id}`;
   }
   return model;
 }
@@ -366,12 +341,7 @@ export async function executeManagerWorkflowAgent(
   try {
     harness = resolveHarness(options.harness);
     effort = resolveEffort(options.effort);
-    model = resolveModel({
-      harness,
-      model: options.model,
-      provider: options.provider,
-      registry: context.parent.modelRegistry,
-    });
+    model = resolveModel({ model: options.model });
     validateSchema(options.schema, harness);
     assertChildWorkingDirectoryAllowed(context.cwd);
   } catch (error) {
@@ -399,7 +369,10 @@ export async function executeManagerWorkflowAgent(
     return failedResult(context, "Agent was aborted");
   }
 
-  let prompt = buildWorkflowAgentPrompt(rawPrompt);
+  let prompt = buildWorkflowAgentPrompt(
+    rawPrompt,
+    resolveAgentPreset(options.preset),
+  );
   try {
     const blackboard = await ensureBlackboard(context.cwd, { refresh: true });
     prompt = withBlackboard(prompt, blackboard);

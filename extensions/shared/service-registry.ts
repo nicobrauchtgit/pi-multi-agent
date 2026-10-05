@@ -1,6 +1,5 @@
 import { randomUUID } from "node:crypto";
 import { isChildExtensionLoad } from "./child-session.ts";
-import type { ObservabilitySink } from "./observability/sink.ts";
 
 export const PROCESS_SERVICE_VERSION = 1 as const;
 export const MAX_PROCESS_SERVICE_WAITERS = 64;
@@ -10,7 +9,6 @@ const DEACTIVATE_KEY = Symbol.for("pi-multi-agent.service.deactivate");
 export interface ProcessServiceResources<Runtime = unknown, Manager = unknown> {
   readonly runtime: Runtime;
   readonly manager: Promise<Manager>;
-  readonly sink: ObservabilitySink;
 }
 
 export interface ProcessServiceHandle<

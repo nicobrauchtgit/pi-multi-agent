@@ -9,7 +9,7 @@
 
 import type { ModelRegistry } from "@earendil-works/pi-coding-agent";
 import { Data } from "effect";
-import type { AgentId, TurnId } from "../../shared/observability/ids.ts";
+import type { AgentId, TurnId } from "../../shared/ids.ts";
 
 export const BACKEND_NAMES = ["pi", "claude", "codex"] as const;
 export type BackendName = (typeof BACKEND_NAMES)[number];
@@ -42,17 +42,12 @@ export interface SubagentIdentity {
   readonly agentId: AgentId;
   readonly turnId: TurnId;
   readonly origin: SubagentOrigin;
-  readonly parentRunId: string;
-  readonly traceId: string;
 }
 
 /** Parent-session context resolved by the tool layer and passed opaquely. */
 export interface ParentContext {
   readonly parentCwd: string;
   readonly projectTrusted: boolean;
-  /** Additive observability correlation supplied by the parent Pi session. */
-  readonly traceId?: string;
-  readonly rootRunId?: string;
   /** Parent pi model, for the pi backend's "inherit" default. */
   readonly inheritedModel?: { readonly provider: string; readonly id: string };
   readonly inheritedThinkingLevel?: string;
@@ -252,6 +247,15 @@ export type SubagentEvent =
       readonly costUsd?: number;
     }
   | { readonly _tag: "MetaChanged"; readonly meta: Partial<SubagentMeta> }
+  | {
+      readonly _tag: "Handoff";
+      readonly fromSessionId?: string;
+      readonly fromSessionFile?: string;
+      readonly toSessionId?: string;
+      readonly toSessionFile?: string;
+      readonly reason: string;
+      readonly summary: string;
+    }
   /** Non-fatal diagnostics. Fatal failures arrive as a RunSettled outcome. */
   | { readonly _tag: "BackendError"; readonly message: string };
 

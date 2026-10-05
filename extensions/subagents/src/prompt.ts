@@ -1,4 +1,5 @@
 /** All model-facing strings for the subagents tools. */
+import { TASK_HARNESS_PROMPT } from "../../shared/harness-routing.ts";
 
 /** Describes subagent_spawn, including harnesses and the fixed concurrency cap. */
 export const SUBAGENT_SPAWN_TOOL_DESCRIPTION =
@@ -11,7 +12,7 @@ export const SUBAGENT_SPAWN_PROMPT_SNIPPET =
 /** Guides the parent model to delegate standalone tasks and avoid unnecessary blocking waits. */
 export const SUBAGENT_SPAWN_PROMPT_GUIDELINES = [
   "Use subagent_spawn to delegate self-contained tasks that can run in the background; give it a complete, standalone prompt.",
-  "Pick the subagent harness deliberately: pi unless you have a reason to prefer Claude Code or Codex (e.g. the user asked for one, or the task suits that harness).",
+  TASK_HARNESS_PROMPT,
   "After subagent_spawn, keep working; results arrive automatically. Only call subagent_wait when you cannot proceed without the result.",
   "Use role for reusable specialists (for example reviewer or researcher). Use subagent_followup with a current-session id, or subagent_resume with the role name after a Pi restart. Role records are listed by subagent_roles and removed by subagent_forget.",
 ];

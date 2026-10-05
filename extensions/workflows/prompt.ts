@@ -6,6 +6,7 @@ import {
   shortenHome,
   type WorkflowDetails,
 } from "./model.ts";
+import { TASK_HARNESS_PROMPT } from "../shared/harness-routing.ts";
 
 /** Model-facing schema descriptions for workflow source, arguments, and background mode. */
 export const WORKFLOW_PARAMETER_DESCRIPTIONS = {
@@ -24,7 +25,7 @@ export const WORKFLOW_TOOL_DESCRIPTION = [
   "• export const meta = { name, description, phases?: [{ title, detail? }] } — optional documentation for the progress UI. `meta.phases` does not drive execution; live progress is driven by runtime `phase(title)` calls.",
   "• phase(title) — mark the current phase at runtime. It may use a documented title from `meta.phases` or introduce a new dynamic phase.",
   "• log(message) — append a bounded script log line for progress/debug notes. Use sparingly for meaningful milestones, decisions, and handoff summaries; do not stream noisy output.",
-  "• await agent(prompt, { harness?, label?, phase?, schema?, model?, provider?, effort? }) — run ONE manager-owned subagent and wait for it. `harness` is pi|claude|codex and defaults to pi. Always resolves to { ok, output, structured?, error? }; check `ok` before using the result. A JSON `schema` yields the validated `structured` object on success for every harness. `model` is a Pi provider/id or id, Claude native alias, or Codex model slug. `provider` is a Pi-only compatibility shim and requires `model`. `effort` uses the shared off|minimal|low|medium|high|xhigh|max scale, mapped to each backend. Children receive normal built-ins and trust-appropriate settings, skills, and AGENTS.md context, but cannot recursively orchestrate or ask the user.",
+  "• await agent(prompt, { harness?, label?, phase?, schema?, model?, effort? }) — run ONE manager-owned subagent and wait for it. `harness` is pi|claude|codex and defaults to pi. Always resolves to { ok, output, structured?, error? }; check `ok` before using the result. A JSON `schema` yields the validated `structured` object on success for every harness. `model` is a Pi provider/id or id, Claude native alias, or Codex model slug. `effort` uses the shared off|minimal|low|medium|high|xhigh|max scale, mapped to each backend. Children receive normal built-ins and trust-appropriate settings, skills, and AGENTS.md context, but cannot recursively orchestrate or ask the user.",
   "• await parallel([() => agent(...), () => agent(...)], { concurrency? }) — run zero-argument agent thunks concurrently and return results in order. Per-run controller concurrency and the one process-wide standalone/workflow manager cap are both 4; workflow calls wait FIFO for a global slot. Use it for fan-out where each child can work independently.",
   "• await pipeline(items, ...stages) — run each item through sequential handover stages while different items fan out concurrently. Each stage receives `(previous, original, index)` and may return text, structured agent results, or any JSON-serializable value for the next stage. Use it for per-file/per-module review chains and explicit handoff between analysis, critique, and synthesis steps.",
   "• args — the parsed value of the `args` tool parameter (or undefined).",
@@ -52,7 +53,8 @@ export const WORKFLOW_PROMPT_SNIPPET =
 export const WORKFLOW_PROMPT_GUIDELINES = [
   "Only call workflow when the user says 'ultracode' or explicitly requests a workflow run; otherwise solve in the main session.",
   "Use workflow when a task needs several subagents with phase dependencies, explicit handover, dynamic fan-out/fan-in, or verify-then-synthesize pipelines; keep single small delegations in the main session.",
-  "Choose agent harness explicitly when backend diversity matters: pi inherits the parent model by default, Claude uses native model aliases, and Codex uses model slugs. Omitted harness defaults to pi; provider is Pi-only.",
+  TASK_HARNESS_PROMPT,
+  "Set each agent's harness explicitly. Pi inherits the parent model by default, Claude uses native model aliases, and Codex uses model slugs.",
   "In workflow scripts, agent() never throws — always check `.ok` on its result before using `.output`/`.structured`.",
   "Use runtime phase(title) for live progress; meta.phases is optional documentation, not a required up-front declaration.",
   "Workflow agent schemas must be bounded, plain, acyclic, object-root JSON Schemas using supported keywords only; do not use unknown keywords or regex-bearing pattern, format, or patternProperties.",
@@ -60,8 +62,14 @@ export const WORKFLOW_PROMPT_GUIDELINES = [
 ];
 
 /** Marks and forwards a workflow script's agent() task as an isolated child-model prompt. */
-export function buildWorkflowAgentPrompt(prompt: string) {
-  return prompt;
+export function buildWorkflowAgentPrompt(prompt: string, preset?: string) {
+  return preset
+    ? `${preset}
+
+---
+
+${prompt}`
+    : prompt;
 }
 
 /** Builds the workflow completion report returned to the parent model. */

@@ -1,12 +1,28 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  TASK_HARNESS_MAP,
+  TASK_HARNESS_PROMPT,
+} from "../shared/harness-routing.ts";
+import {
   buildSubagentResultMessage,
   buildSubagentSpawnResult,
   formatStructuredResult,
   structuredResultDetails,
   structuredResultWaitBudget,
+  SUBAGENT_SPAWN_PROMPT_GUIDELINES,
 } from "./src/prompt.ts";
+
+test("task harness preferences are injected without choosing models", () => {
+  assert.deepEqual(TASK_HARNESS_MAP, {
+    planning: ["claude"],
+    implementation: ["codex"],
+    review: ["claude", "codex"],
+  });
+  assert.ok(SUBAGENT_SPAWN_PROMPT_GUIDELINES.includes(TASK_HARNESS_PROMPT));
+  assert.match(TASK_HARNESS_PROMPT, /Every review must use two independent/);
+  assert.match(TASK_HARNESS_PROMPT, /Choose each model separately/);
+});
 
 test("schema-less prompt results retain their previous text", () => {
   assert.equal(

@@ -182,6 +182,7 @@ export function blackboardPromptBlock(info: BlackboardInfo): string {
     "- Read the board first; do not duplicate a claim another agent already posted.",
     '- Keep entries short and actionable: claims ("claiming <task>"), findings, handoffs, blockers.',
     "- Anchor each entry to the file/line it concerns; for non-code coordination, anchor to a stable file (e.g. README or an agreed coordination file) line 1.",
+    "- The board is BEST-EFFORT coordination, not a deliverable. If any `comment add`/`list` times out or errors (e.g. the Hunk daemon is unresponsive), DO NOT retry it and DO NOT loop — abandon the board immediately and put your findings/handoffs in your normal task output instead. Never let the board block your actual work.",
     "- The full Hunk CLI is in the bundled `hunk-review` skill: run `hunk skill path hunk-review` and read that file.",
     "",
   ].join("\n");

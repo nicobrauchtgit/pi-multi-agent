@@ -40,7 +40,6 @@ Design preference from Nicolas:
 /subagents
 /workflows
 /btw
-/observability
 ```
 
 ### Tools
@@ -104,7 +103,9 @@ extensions/workflows/
 
 extensions/shared/
   child-session.ts                 trust-aware child resources, child-load scope/filter, tool denylist, shutdown
-  service-registry.ts              versioned globalThis manager/runtime/sink ownership boundary
+  harness-routing.ts               task-kind preferences injected into subagent and workflow prompts
+  ids.ts                           manager-owned run, agent, and turn IDs
+  service-registry.ts              versioned globalThis manager/runtime ownership boundary
   workflow-metadata.ts             workflow ownership validation and UTF-8 bounds
   text.ts                          shared UTF-8-safe truncation
   json-schema.ts                   bounded JSON Schema guard + TypeBox adapter
@@ -127,9 +128,9 @@ Workflow agent() ─┘          │
                              └─> one agent lifecycle/event vocabulary
 ```
 
-`extensions/subagents/index.ts` is the sole provider of the manager, managed runtime, and observability sink. `extensions/workflows/index.ts` resolves that service lazily through the versioned `globalThis` registry, so separately evaluated extension modules and load order do not create duplicate managers. Owner token, epoch, and shutdown signal cover reload/session replacement. In-process Pi child resource reloads run inside a global `AsyncLocalStorage` scope, PackageManager's scoped settings getters are exact-realpath filtered, and the final loaded extension set is filtered again; children therefore neither load the orchestration entries nor acquire the parent service.
+`extensions/subagents/index.ts` is the sole provider of the manager and managed runtime. `extensions/workflows/index.ts` resolves the process service lazily through the versioned `globalThis` registry, so separately evaluated extension modules and load order do not create duplicate managers. Owner token, epoch, and shutdown signal cover reload/session replacement. In-process Pi child resource reloads run inside a global `AsyncLocalStorage` scope, PackageManager's scoped settings getters are exact-realpath filtered, and the final loaded extension set is filtered again; children therefore neither load the orchestration entries nor acquire the parent service.
 
-Workflow run events remain run-level only. Every workflow agent lifecycle event, snapshot, cancellation, and settlement is manager-owned. The old workflow child runner and its tests are deleted with no fallback flag.
+Every workflow agent lifecycle, snapshot, cancellation, and settlement is manager-owned. The old workflow child runner and its tests are deleted with no fallback flag.
 
 ---
 
@@ -153,6 +154,12 @@ pi      in-process Pi SDK session
 claude  Claude Code Agent SDK
 codex   codex app-server JSON-RPC
 ```
+
+The shared task preference map currently routes planning work to Claude and
+implementation work to Codex. Every review uses two independent reviewers, one
+Claude subagent and one Codex subagent, and the parent reconciles both results.
+Both standalone and workflow prompt guidance receive the rendered map. The
+parent model still chooses each model within its selected harness.
 
 The manager tracks normalized events:
 
@@ -282,7 +289,6 @@ Workflow `agent()` is manager-backed and accepts:
 await agent("review this", {
   harness: "pi" | "claude" | "codex", // defaults to pi
   model: "backend-specific model hint",
-  provider: "pi-only compatibility provider",
   effort: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max",
   schema: OBJECT_ROOT_JSON_SCHEMA,
   label: "bounded display label",
@@ -290,7 +296,7 @@ await agent("review this", {
 });
 ```
 
-Pi model hints use `provider/id` or a resolvable bare id; the existing separate `provider` option remains as a Pi-only migration shim. Claude uses its native alias and Codex uses its model slug. Structured results, trust gating, Hunk prompts, child deny-lists, context/usage/transcript projection, and cancellation all flow through the same backend implementations as standalone agents. Workflow agents are role-less, visible in both TUIs, hidden from standalone model-facing subagent tools, and never auto-deliver a second parent follow-up.
+Pi model hints use `provider/id` or a resolvable bare id. Claude uses its native alias and Codex uses its model slug. Structured results, trust gating, Hunk prompts, child deny-lists, context/usage/transcript projection, and cancellation all flow through the same backend implementations as standalone agents. Workflow agents are role-less, visible in both TUIs, hidden from standalone model-facing subagent tools, and never auto-deliver a second parent follow-up.
 
 `meta.phases` is optional documentation. Runtime progress is driven by `phase(title)`.
 
@@ -465,37 +471,6 @@ results.
 
 ---
 
-### Task C0 — Observability contracts and run-level workflow events — completed 2026-08-21
-
-Implemented and verified:
-
-- the manager synchronously mints immutable `runId`, `agentId`, and initial
-  `turnId` metadata before backend availability or spawn work while preserving
-  `sa-N`/`btw-N` as display IDs;
-- follow-ups keep the run/agent identity and advance the turn identity at the
-  first native `UserMessage`/`RunStarted` boundary, so backends that announce
-  the prompt first still attribute it to the new turn; backend-native role
-  reopen creates a fresh run/agent identity while existing native resume
-  metadata continues to link history;
-- a versioned, byte-bounded event envelope and shared `ObservabilitySink` seam
-  now have default no-op and bounded recording implementations;
-- manager events cover creation, run boundaries, finalized message/tool
-  metadata, usage/meta/error, and settlement without storing prompts,
-  transcript bodies, tool arguments/results, or streaming deltas;
-- workflow code emits only `workflow.started`, `workflow.phase`,
-  `workflow.log`, and `workflow.settled`; it emits no agent lifecycle events.
-  At the C0 checkpoint execution still used the old runner; C1 below removed it;
-- `WorkflowDetails` and manager snapshots remain the live in-memory TUI
-  projections, and observability failures cannot affect lifecycle or returns;
-- deterministic identity/order/bounds/fault-isolation tests and all repository
-  acceptance commands pass.
-
-C0 adds no daemon, database, persistence, redaction implementation,
-model-visible API, child-hook claim map, or second agent lifecycle vocabulary.
-At the C0 checkpoint, the production sink remained no-op pending the later staged producer/storage work.
-
----
-
 ### Task C1 — Unify workflow `agent()` with `SubagentManager` — completed 2026-08-22
 
 Implemented and verified:
@@ -515,8 +490,7 @@ Implemented and verified:
   events, artifacts, or TUI rendering; workflow roles/resume/send are rejected
   and persistence is additionally origin-gated;
 - the DSL supports Pi, Claude, and Codex, backend-specific model hints, a
-  shared effort scale, structured schemas, labels, and phases; Pi's provider
-  option remains a documented migration shim;
+  shared effort scale, structured schemas, labels, and phases; backend-specific model hints;
 - workflow cancellation, invocation cancellation, service replacement, and
   shutdown cancel admission waiters, active native work, and spawn races, then
   wait for cleanup within existing bounds;
@@ -541,155 +515,6 @@ Acceptance evidence:
 - the opt-in live workflow suite completes one structured Pi/Claude/Codex DSL
   matrix and one real Codex cancellation with settled artifacts.
 
-At the C1 checkpoint, Task D could begin separately; C1 itself added no daemon,
-SQLite, network/spool storage, redaction, web UI, diff capture, or observability
-persistence. D1 is now complete below without changing that C1 runtime boundary.
-
----
-
-### Task D — Observability and artifact/result integration
-
-The canonical design, schema, security model, gates, and rollback points are in
-[`docs/observability-architecture.md`](docs/observability-architecture.md).
-Implement in this order only after C1 is accepted:
-
-#### D1 — Minimal daemon and SQLite projections — completed 2026-08-23
-
-Implemented as a standalone bare-Node ESM companion under `companion/`:
-
-- default `start` plus CLI `status`, `quick-check`, and offline
-  `rebuild [--check]`; deterministic machine-readable exits cover runtime,
-  security, lock, migration/newer-schema, and corruption failures;
-- protected companion home, dead-PID/start-token singleton lock, atomic
-  token/state/counter files, one `node:sqlite` WAL writer, migration v1, and
-  exactly `events`, `runs`, and `agents` application tables;
-- only minimal unauthenticated `/healthz` and authenticated exact-Host
-  `POST /v1/ingest`; no read data API or static UI before D3;
-- bounded inert envelope validation, opaque IDs, mandatory recursive daemon
-  re-redaction through the one shared `extensions/shared/redaction.mjs`,
-  UTF-8-safe truncation/omission and full second scan, project-ID recomputation,
-  receive-order sequence, complete stored-event fingerprint idempotency/conflicts,
-  and atomic pure-reducer projections/rebuild;
-- temp-home/subprocess tests for runtime, permissions/locks/tokens, HTTP gates,
-  schema/migrations, WAL SIGKILL recovery, fault rollback, duplicates/skew,
-  reducer/incomplete/terminal semantics, rebuild, and seeded leak scans.
-
-D1 deliberately does **not** connect the C0 sink or Pi hooks, autostart from an
-extension, implement spool/replay or child protected paths, expose read/UI
-routes, reconcile artifacts, retain/purge/export data, or change any
-model-visible surface. Production capture remained no-op at the D1 checkpoint; D2 below now connects it.
-
-Rollback: stop the opt-in daemon and remove only an explicitly selected D1 test
-companion home/database. No extension imports `companion/`, so orchestration is
-unchanged.
-
-#### D2 — Pi/manager ingestion, protected spool, and autostart — completed 2026-08-24
-
-Implemented and verified:
-
-- `extensions/subagents/index.ts` now owns one process-wide guarded producer,
-  daemon controller, runtime, and manager; workflows consume the same sink and
-  child/duplicate extension loads cannot create another producer;
-- root Pi session/run, prompt, finalized assistant/thinking, turn, tool,
-  compaction, model/context/usage, and shutdown facts flow beside existing
-  manager and workflow-run events; deltas/provider payloads remain uncaptured
-  and manager remains sole owner of `agent.*` lifecycle;
-- producer and daemon literally share out-of-band JSON-token redaction →
-  UTF-8-safe field/aggregate bound → complete second-scan normalization.
-  Normalization runs before the bounded memory queue and every immutable spool
-  byte; failures retain reason/counts only and there is no emergency payload
-  file;
-- the producer batches at 100 ms / 64 events / 512 KiB inside a 512-event / 4
-  MiB queue, coalesces usage/meta, uses bounded loopback HTTP/token discovery
-  and deterministic retry, and spools durable pressure/shutdown records;
-- protected 8 MiB NDJSON segments use fsync + atomic rename, 64 MiB aggregate
-  cap, producer-local ACK/counter state, complete-line stale-temp recovery,
-  per-record malformed/version isolation, payload-free quarantine metadata,
-  ordered idempotent adoption/replay by producer and daemon, and empty-directory
-  GC;
-- authenticated lazy autostart coalesces concurrent callers, waits through the
-  lock-before-state cold-start race, treats runtime exit 69 as permanent spool
-  mode, and leaves the shared daemon running on bounded reload/shutdown flush;
-- protected `config.json` supports top-level `capture: off|metadata|rich`,
-  autostart, canonical longest-root project enabled/content policy,
-  `excludePaths`, storage/retention defaults, and `moshiPaths`; missing project
-  attribution fails closed, and producer plus daemon independently cap D2 rich
-  configuration to metadata;
-- `received_at_ms` is now a plain display-only wall-clock batch stamp. SQLite
-  `events.seq` remains the sole order/cursor and the three-table D1 schema is
-  unchanged;
-- canonical child protection covers the companion root and every token/DB/WAL/
-  SHM/state/lock/spool/config/log/export child, roles, workflow artifacts,
-  future run artifacts, and configured Moshi roots. Pi file/search tools are
-  wrapped at execution, Claude uses `PreToolUse` denial, implicit cwd and
-  grep/find glob vectors are covered, and unsafe child working directories are
-  rejected before backend spawn;
-- rich production capture is intentionally forced to metadata-only because
-  shell access and Codex filesystem reads do not have a reliable same-UID
-  isolation boundary. `0600` and command-string matching are not claimed as
-  security. This is a process-wide fallback because all backends share one DB.
-
-Rollback: set `~/.pi/agent/multi-agent/observability/config.json` top-level
-`"capture": "off"`, then restart/reload Pi. The service uses the no-op sink,
-performs no autostart or spool-record writes, and keeps the C1 manager/workflow
-path unchanged. It never restores the deleted legacy runner.
-
-#### D3 — Read-only API and polling web UI — completed 2026-08-24
-
-Implemented and verified:
-
-- the existing single daemon now serves read-token-only `/v1/status`, bounded keyset run pages, run detail/agents, agent detail, and run/agent sequence-event pages; read and ingest capabilities remain timing-safe and mutually exclusive, and authentication precedes read route/query parsing;
-- the same synchronous `node:sqlite` connection handles every read in one await-free block. Schema v1, `user_version = 1`, three application tables, and all ten D1 indexes are unchanged; event queries demonstrate `events_run_seq`/`events_agent_seq`, while a new runs-list index is deferred to measured D5 tuning;
-- every list has strict allowlisted parameters, bound values, deterministic tie-breaks, row and byte caps, `currentSeq`/`minRetainedSeq`, and a `410 cursor-pruned` resnapshot contract. Malformed stored JSON becomes an explicit unavailable state and raw bytes are never reflected;
-- exactly `/`, `/app.js`, and `/app.css` are loaded from validated in-repository files at daemon startup and served from an in-memory allowlist with strict CSP, MIME, no-store/nosniff/no-referrer/frame/COOP/CORP/permissions protections. There is no request-derived path join, remote resource, inline execution, framework, build, or runtime dependency;
-- `/observability` is a non-model-visible TUI command. It opens a loopback fragment capability; the app validates and immediately removes that fragment, keeps it only in module memory, and uses bearer-authenticated same-origin fetches. A reload needs a new command invocation. No token enters queries, response bodies, DOM, web storage, logs, or console;
-- the vanilla UI provides runs with project/status/kind filters, run workflow/parent/agent lanes, agent detail, and system health. It shows loading, empty, read error, stale-cursor reload, daemon restart, metadata-only, redacted, omitted, truncated, unavailable, and recovered states; polling is scoped, non-overlapping, hidden-page paused, backoff-bounded, and not SSE;
-- API/static/security/UI helper suites and a live temp-home Helium pass cover parent/workflow plus Pi/Claude/Codex metadata events, every view, filters, empty/loading/error/restart states, screenshots, network/console/storage inspection, fragment removal, and clean browser/daemon shutdown.
-
-D3 has no export route. Redacted export remains D4 together with retention/purge and artifact work. `BUILD_VERSION` is now `0.3.0-d3`; stop a still-running D2 daemon before reuse. Producers remain in bounded spool mode during the rollout gap.
-
-Rollback: stop serving only read/static dispatch while ingestion/storage remains active, or use the existing D2 protected `"capture": "off"` switch. There is no schema rollback.
-
-#### D4 — Shared redacted artifacts and reconciliation
-
-Create a protected redacted run artifact layout outside SQLite for:
-
-- structured outputs;
-- final reports;
-- bounded transcripts;
-- Hunk result comments when safe;
-- role records pointing to latest artifacts.
-
-Persist these for standalone and workflow-owned manager agents, closing
-`TASK-D-001`. SQLite stores only artifact references, hashes, sizes,
-redaction/truncation state, and bounded previews/recovery metadata; it never
-copies complete code, results, transcripts, patches, or diffs. Reconcile
-existing bounded workflow/shared artifacts idempotently as recovery/enrichment
-without overriding primary hook/manager facts. Add age/DB/spool caps, offline
-purge, and redacted export.
-
-Never expose the companion home to a child. If an agent must receive an output
-artifact path, use a separate agent-owned path inside its cwd/configured
-writable root (including Codex sandbox requirements), then import it through the
-same bounds/redaction pipeline.
-
-#### D5 — Dogfood and honest change summaries
-
-Tune caps/indexes from measured local use before normalizing more tables.
-Optionally add bounded changed-file summaries only after the timeline is useful.
-Use VCS repository/revision/blob/path references as the content backing where
-available; keep source lines and diffs out of SQLite. Include high-level symbol
-or AST metadata only when existing tooling exposes it without a speculative
-parser subsystem. Shared-worktree results must be labelled
-`shared/unattributed`. Exact child-hook or diff attribution requires a later
-non-racy API or worktree/atomic-patch isolation and is not a v1 claim.
-
-Task D acceptance includes the redaction leak evaluation, child deny-path tests,
-projection replay/rebuild tests, daemon-outage tests, retention/purge/export,
-and the rollback gates in the architecture document.
-
----
-
 ### Task E — Supervisor UX hardening
 
 Current `/subagents` takeover already supports send/abort plumbing. Improve
@@ -700,15 +525,32 @@ reliability and visibility:
 - add dashboard action for inactive role resume after Task A;
 - verify mid-run steering for Pi, Claude, Codex;
 - ensure queued follow-ups are visible;
-- add non-model-visible links to read-only web run/agent detail when available;
-- show redaction, truncation, artifact recovery, and telemetry-gap badges without
-  making the TUI depend on the database;
 - optionally close `TASK-E-001` with a structured-output badge.
 
-The live manager remains the authority for TUI actions. Web/daemon failure must
-not disable supervision, and web controls remain deferred.
+### Task F1 — Automatic Pi subagent handoff — design accepted 2026-08-31
 
----
+The accepted architecture direction is captured in
+[`docs/subagent-automatic-handoff-architecture.md`](docs/subagent-automatic-handoff-architecture.md).
+Automatic handoff is a Pi-backend-first subagent platform capability: a
+configurable context threshold triggers a handoff prompt and continuation in a
+fresh same-config child session. Claude/Codex adapters come only after the Pi
+SDK path is proven.
+
+Implementation is not started. Keep handoff independent of implementation,
+review, workflow, and task-loop semantics.
+
+### Task F2 — Coded implementation task loop — design accepted 2026-08-31
+
+The accepted architecture direction is captured in
+[`docs/implementation-task-loop-architecture.md`](docs/implementation-task-loop-architecture.md).
+Implementation loops are durable parent-owned task controllers, not agent
+sessions. They loop between implementation and review until `acceptance_met` is
+proven by measurable code checks and `no_changes_requested` is set by review for
+the same checkpoint.
+
+Implementation is not started. Keep children unable to recursively orchestrate;
+parent/task-loop controllers own all spawning, loop state, acceptance evidence,
+and review issue communication.
 
 ## 7. Verification commands
 
@@ -785,23 +627,18 @@ Rollback would involve moving current `extensions/{subagents,workflows,shared}` 
   remain fail-fast so a wide workflow can temporarily block new standalone work.
 - Explicit cancellation force-settles a still-running native entry as interrupted
   once the backend acknowledges; a racing late completion cannot replace that result.
-- Manager-backed workflow transcripts intentionally contain bounded UI previews,
-  not the deleted runner's fuller tool payloads; rich redacted transcripts and
-  oversized explicit result preservation remain Task D (see `BUGS.md`).
-- D3 read/UI is available through `/observability` and remains independent of
-  orchestration. The capability is memory-only and rotates with the daemon, so
-  browser reload requires invoking the command again. Shared redacted
-  standalone/workflow artifacts, reconciliation, retention, purge, and export
-  remain D4.
-- Rich capture is not currently available in production even if configured:
-  shell tools and Codex reads cannot enforce a same-UID protected-path boundary,
-  so producer and daemon narrow the shared store process-wide to metadata.
-  Pi/Claude file-tool denial is defense in depth, not an OS sandbox; unrestricted
-  same-UID code can also forge/delete/flood spool state. Unicode-confusable
-  secret spellings remain outside the fixed ASCII scanner (see `BUGS.md`).
-- Structured standalone results are live snapshot/tool data only; durable run
-  artifacts and Hunk result summaries remain D4.
+- Manager-backed workflow transcripts intentionally contain bounded UI previews.
+- Structured standalone results are live snapshot/tool data only.
 - Hunk blackboard is ephemeral and requires repo/diff context.
+- Automatic Pi subagent handoff is design-only. The accepted direction is
+  documented in
+  [`docs/subagent-automatic-handoff-architecture.md`](docs/subagent-automatic-handoff-architecture.md):
+  handoff is a Pi-backend-first subagent platform feature independent of task
+  semantics.
+- Coded implementation/review task loops are design-only. The accepted direction
+  is documented in
+  [`docs/implementation-task-loop-architecture.md`](docs/implementation-task-loop-architecture.md):
+  task loops are durable acceptance/review controllers independent of agent IDs.
 - Error retry is parent-decided from error text; no special blocked state exists.
 - API/provider daily caps can break subagents. If parent can continue afterward, retry failed cap-limited subagents once.
 
@@ -847,17 +684,6 @@ Completed on 2026-08-20:
    - structured results and schema errors in normalized snapshots and tool/result delivery;
    - role schema persistence and portable regression coverage.
 
-Completed on 2026-08-21:
-
-1. Task C0 observability contracts and run-level events:
-   - durable manager run/agent/turn identity before backend side effects;
-   - versioned bounded event contracts plus no-op/recording sink seams;
-   - normalized manager lifecycle events with metadata-only message/tool
-     capture, content-labelled diagnostics, and no streaming deltas;
-   - workflow run-only start/phase/log/settlement events;
-   - fault-isolation, identity, ordering, bounds, regression, smoke, and startup
-     verification.
-
 Completed on 2026-08-22:
 
 1. Task C1 workflow-agent unification:
@@ -871,39 +697,10 @@ Completed on 2026-08-22:
      child execution path;
    - hermetic full gates plus opt-in live matrix/cancellation verification.
 
-Completed on 2026-08-23:
+Completed on 2026-08-23/24:
 
-1. Task D1 minimal observability companion:
-   - bare-Node loopback ingest daemon with protected singleton ownership and
-     graceful state/SQLite lifecycle;
-   - exact three-table WAL schema/migration, atomic idempotent event ingestion,
-     pure projections, status/quick-check/rebuild maintenance;
-   - single shared fixed-rule redaction with exact marker idempotency and secret-field
-     subtree suppression, full daemon re-scan, bounds and unknown-kind safety;
-   - complete stored-event idempotency fingerprints, producer truncation provenance,
-     compare-checked stale-lock reclaim, and exact golden-schema verification;
-   - deterministic storage/security/fault/subprocess acceptance coverage with no
-     D2-D5 producer, read/UI, artifact, or model-surface scope.
-
-Completed on 2026-08-24:
-
-1. Task D2 producer, hooks, spool, policy, and autostart:
-   - one subagents-owned process producer shared by manager/workflows and root Pi hooks;
-   - shared producer/daemon redaction and content/envelope budgets before queue/disk;
-   - bounded coalescing queue, protected immutable spool, adoption/replay/ACK/GC;
-   - authenticated lazy daemon autostart, concurrent cold-start reuse, bounded shutdown;
-   - independent protected longest-root daemon policy and `capture: "off"` rollback;
-   - canonical Pi/Claude file-tool protected paths plus honest process-wide
-     metadata fallback for unenforceable shell/Codex same-UID access;
-   - wall-clock `received_at_ms` drift fix with daemon `seq` as sole order;
-   - deterministic unit/subprocess/live-temp-daemon coverage without D3-D5 or
-     model-visible surface.
-
-2. Task D3 authenticated read API and local polling UI:
-   - separate read-only bearer scope on status/run/agent/scoped-event routes;
-   - deterministic bounded SQL pages, watermarks, 410 floor recovery, and
-     malformed-row degradation on the unchanged three-table schema;
-   - startup-frozen three-asset vanilla UI with strict browser/HTTP hardening;
-   - fragment-to-memory `/observability` bootstrap and four read-only views;
-   - API/security/UI regression suites plus live Helium view/filter/error/restart
-     and token-surface acceptance with screenshots.
+1. Retired daemon stack:
+   - removed the old companion/producer/spool/redaction implementation from the
+     active architecture;
+   - kept the single manager-owned workflow agent path and no model-visible
+     lifecycle split.
